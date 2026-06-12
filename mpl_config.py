@@ -1,3 +1,6 @@
+# Alternative matplotlib configuration (larger fonts, no LaTeX rendering,
+# Type-42 fonts) for screen viewing / presentation-style figures. Counterpart
+# of config_mpl.py, which produces the publication-ready LaTeX figures.
 import matplotlib as mpl
 from pathlib import Path
 

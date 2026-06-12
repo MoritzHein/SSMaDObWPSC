@@ -1,8 +1,20 @@
+# Generators and helpers for the simulated case study (Sec. IV-A of the paper):
+#  - generate_random_workflows(): random workflow DAGs with parallel branches
+#    and function attributes sampled within the bounds of Table 2,
+#  - generate_cloud(): a random hierarchical serverless architecture (levels of
+#    regions/providers, Fig. 3a) written as one JSON config per (level, region),
+#  - generate_full_cloud(): the flattened single-level architecture of all
+#    physical nodes used by the centralized comparison (latencies recomposed
+#    through the hierarchy as in Algorithm 1),
+#  - update_*_config(): pass the decisions of an upper decomposition level down
+#    to the subproblems of the next level.
 import numpy as np
 import json
 import networkx as nx
 import os
 import re
+# Add the utilization M_i caused by the just-placed workflow to the per-node
+# "utilization" field, so the next workflow's placement starts from M_{i,0} > 0.
 def update_cloud_config(requirements_cloud_config, requirements_workflow_config, P,M):
     for i in range(M.shape[0]):
         requirements_cloud_config["providers"][f"provider_{i}"]["utilization"]=requirements_cloud_config["providers"][f"provider_{i}"]["utilization"]+M[i][0]
@@ -18,6 +30,14 @@ def update_cloud_config(requirements_cloud_config, requirements_workflow_config,
     return requirements_cloud_config
 
 
+# Prepare the workflow config of a lower-level subproblem from the parent
+# solution (decomposition, Sec. III-C): P/H are the parent's placement and
+# selection matrices and current_node is this region's index (= its head node)
+# within the parent problem. Deployments whose functions were all placed
+# elsewhere are pruned, the parent's workflow selection is fixed via
+# "selection_list" (Eq. (5)), and functions placed outside this region are
+# recorded per function in "function_set" so solve_opt can pin them to the
+# head node as virtual placements (Eq. (3)).
 def update_requirements_config(requirements_workflow_config, P,H, current_node,current_leave_k, num_nodes,seed=42):
     np.random.seed(seed)
     num_functions = requirements_workflow_config["num_functions"]
@@ -27,11 +47,15 @@ def update_requirements_config(requirements_workflow_config, P,H, current_node,c
     if len(P) == 0:
         num_workflows = 0
     else:
+        # Keep only deployments n that have at least one function placed on
+        # this region's head node; reduce deployment_number accordingly.
         for n in range(num_workflows):
             if all(P[n * num_functions:(n + 1) * num_functions, current_node] == 0):
                 num_workflows -= 1
             else:
                 n_list.append(n)
+        # Deployments selected by at least one upper-level leaf stay selected
+        # for all users of this region (regional selection coupling).
         for n in range(num_workflows):
             if sum(H[:,n_list[n]])>0:
                 selection_list.append(n)
@@ -41,6 +65,9 @@ def update_requirements_config(requirements_workflow_config, P,H, current_node,c
         #else:
         #    selection_list=H[current_leave_k,:].tolist()
         requirements_workflow_config["selection_list"]=selection_list
+        # function_set[m] = deployments whose function m was NOT placed on this
+        # region's head node, i.e. it runs in another region and only appears
+        # here virtually (communication enters through the head node).
         for m in range(num_functions):
             liste = []
             for n in range(num_workflows):
@@ -65,6 +92,10 @@ def update_requirements_config(requirements_workflow_config, P,H, current_node,c
     return requirements_workflow_config
 
 
+# Build a random workflow DAG (Fig. 2 of the paper): functions 0 and
+# n_nodes-1 are the common start/finish, the remaining functions are split
+# into n_parallel_paths disjoint chains (the "branches"). Returns the graph
+# and the list of branches (each a list of function indices).
 def generate_connected_graph_with_paths(n_nodes, n_parallel_paths=2, seed=42):
     # assert n_nodes >= 4, "Need at least 4 nodes to have interesting parallel paths"
     np.random.seed(seed)
@@ -102,6 +133,13 @@ def generate_connected_graph_with_paths(n_nodes, n_parallel_paths=2, seed=42):
     return G, path_list
 
 
+# Sample num_workflows random workflows with attributes uniformly distributed
+# within the bounds of config_random_workflows (Table 2): number of
+# deployments, number of functions, per-function execution time, cloud speedup
+# factor, RAM usage, output data size and (with probability
+# data_dependencies_prob) a data dependency stored at one cloud provider.
+# Each workflow is written num_opts times (one copy per decomposition
+# subproblem, since the copies are modified independently while descending).
 def generate_random_workflows(num_workflows,num_opts, config_random_workflows,provider_name, num_run=0,seed=42):
     np.random.seed(seed)
     if not os.path.exists(os.path.join("workflows",f"run_{num_run}")):
@@ -152,6 +190,10 @@ def generate_random_workflows(num_workflows,num_opts, config_random_workflows,pr
         for m in range(len(paths)):
             config["paths"].update({str(m): paths[m]})
 
+        # Sample each function's attributes. With probability
+        # data_dependencies_prob the function depends on data stored at one of
+        # the cloud providers ("tinyfaas" = no dependency); accessing it from a
+        # different provider later costs pricing_Storage_Transfer per MB.
         for k in range(num_functions):
             p_list=[(data_dependencies_prob)/(len(provider_name)-1) for k in range(len(provider_name)-1)]+[1-data_dependencies_prob]
             value=np.random.choice(len(provider_name), 1, p=p_list)[0]
@@ -179,6 +221,8 @@ def generate_random_workflows(num_workflows,num_opts, config_random_workflows,pr
                     "function_set": {}
                 }
 
+        # One identical copy per decomposition subproblem; copy k is later
+        # specialized by update_requirements_config for subproblem k.
         for k in range(num_opts):
             path = os.path.join(f"workflows/run_{num_run}", f"requirements_workflow_{i}_{k}.json")
             with open(path, "w") as f:
@@ -193,6 +237,20 @@ def generate_random_workflows(num_workflows,num_opts, config_random_workflows,pr
     return workflow_name_list
 
 
+# Sample the hierarchical serverless architecture (Fig. 3a / Fig. 5):
+#  - Level 0 contains the top-level representatives: one head node per cloud
+#    provider plus num_tiny_first edge ("tinyfaas") regions.
+#  - On every following level each node of the previous level expands into a
+#    region of nodes_min..nodes_max nodes of the same provider; node 0 of each
+#    region is its head node (the link to the level above).
+#  - Edge nodes are leaves (users send requests from them) and have finite
+#    RAM; cloud nodes have infinite RAM but cost money. RAM and request rates
+#    of a region are split among its children with a Dirichlet distribution so
+#    that the totals are preserved across levels (cf. Eq. (2)).
+#  - Latencies within a region shrink by base_decrease per level
+#    (L_l,upper bound = L_nodes * b_decrease^-l, Sec. IV-A).
+# Writes one requirements_cloud_<level>_<region>.json per subproblem and a
+# general_config.json describing the whole hierarchy.
 def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyfaas"],num_tiny_first=2,provider_cost_list=[],provider_dev=[],config_random_cloud=[],seed=42):
     np.random.seed(42)
     if not os.path.exists(os.path.join("cloud",f"run_{num_run}")):
@@ -216,6 +274,11 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
     leave_list = []
     predecessor_list = []
 
+    # ---- First pass: build the bookkeeping lists of the hierarchy.
+    # num_nodes_in_level[l][region] = number of nodes in that region,
+    # provider_list[l] = provider of every node on level l (flattened),
+    # leave_list[l]    = True where requests can originate (head nodes / edge),
+    # predecessor_list[l][region] = index of the parent subproblem.
     num_opt = 0
     node_list=[]
     for r in range(num_levels):
@@ -232,6 +295,10 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
             curr_node=1
 
         else:
+            # Every node of the previous level becomes one region with a random
+            # number of nodes; non-edge regions expose only their head node as
+            # "leaf" (it collects the requests of the levels above), while
+            # every node of an edge (tinyfaas) region is a user-facing leaf.
             node_list.append([])
             num_nodes_in_level.append([])
             num_leaves_in_level.append([])
@@ -269,16 +336,21 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
             num_opt+=len(num_nodes_in_level[-2])
 
     curr_node = 0
+    # Physical user leaves = all edge nodes of the last (physical) level.
     num_leaves_ges=0
     for provider in provider_list[-1]:
         if provider == "tinyfaas":
             num_leaves_ges+=1
+    # ---- Second pass: write the per-region cloud config files with sampled
+    # latencies, RAM budgets, request rates, speedups and provider pricing.
     latencies_list=[[]]
     speedup_list=[]
     for k in range(num_levels):
 
         if k == 0:
 
+            # Level 0: one single region holding all top-level head nodes.
+            # Latencies are sampled symmetrically (L[r,t] = L[t,r]).
             num_leaves = num_leaves_in_level[k][0]
             num_clouds_in_level = 1
             num_nodes = num_nodes_in_level[k][0]  # np.random.randint(3,10)
@@ -352,6 +424,8 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
                 json.dump(config, f, indent=4)
 
         else:
+            # Lower levels: one config file per region m. Latency bounds shrink
+            # with base_decrease**k (connections become increasingly local).
             num_clouds_in_level = sum(num_nodes_in_level[k - 1])  # len(nodes_list[-1])
             name_list.append([])
             ram_list.append([])
@@ -375,6 +449,9 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
                             L[t, r] = rand_latencies[ind]
                             ind += 1
                 # predecessor_list.append([m for k in range(num_nodes)])
+                # Split the parent's RAM budget and request rate randomly among
+                # the region's nodes (Dirichlet keeps the totals constant);
+                # cloud regions (infinite RAM) generate no user requests.
                 request_overall = sum(request_list[-2])
                 if ram_list[-2][m] == np.inf:
                     ram = [np.inf for k in range(num_nodes)]
@@ -394,6 +471,9 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
                 # curr_node+=num_nodes
                 cloud_name = f"requirements_cloud_{k}_{m}.json"
                 path = os.path.join(f"cloud/run_{num_run}", cloud_name)
+                # provider_0 is the region's head node; it additionally carries
+                # the request rate of all other regions (request_overall),
+                # acting as placeholder for outside requests (Eq. (7)).
                 config = {
                     "name": f"cloud_{k}_{m}",
                     "num_nodes": num_nodes,
@@ -437,6 +517,8 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
                     latencies_list[-1].append(list(L[:, s+1]))
                 with open(path, "w") as f:
                     json.dump(config, f, indent=4)
+    # Store the hierarchy description ("ges" = gesamt, i.e. total) used by
+    # placement.py, selection_simulation.py and generate_full_cloud().
     ges_nodes = 0
     for k in range(num_levels):
         for value in num_nodes_in_level[k]:
@@ -458,6 +540,12 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
     with open(path_general_config, "w") as f:
         json.dump(cloud_general_config, f, indent=4)
 
+# Flatten the hierarchy into one architecture containing only the physical
+# (last-level) nodes - the input of the centralized comparison and of the
+# selection simulation. End-to-end latencies between nodes of different
+# regions are recomposed by walking up the predecessor tree until the two
+# nodes share a region, summing the head-node link latencies on the way
+# (this is Algorithm 1 of the paper).
 def generate_full_cloud(config,num_run,provider_cost_list,num_levels):
     path=os.path.join(f"cloud/run_{num_run}", "requirements_cloud_full.json")
     full_config={}
@@ -472,6 +560,8 @@ def generate_full_cloud(config,num_run,provider_cost_list,num_levels):
     leave_list=config["leave_list"][-1]
     provider_list=config["provider_list"][-1]
     num_nodes_in_level=config["num_nodes_in_level"]
+    # k iterates over all physical nodes; ind_k is the region of node k on the
+    # last level and curr_k its local index within that region.
     curr_len_k=num_nodes_in_level[-1][0]
     curr_k=0
     ind_k=0
@@ -496,6 +586,11 @@ def generate_full_cloud(config,num_run,provider_cost_list,num_levels):
             level_start.append(num_opt)
             num_opt+=len(predecessor_list[r])
 
+        # Latency from node k to every other physical node m (Algorithm 1):
+        # same region -> direct intra-region latency; otherwise climb both
+        # predecessor chains in lockstep, adding each node's latency to its
+        # region's head node (index 0), until a common region is found, where
+        # the remaining gap is bridged by that region's internal latency.
         latencies_list=[]
         curr_len_m = num_nodes_in_level[-1][0]
         curr_m = 0

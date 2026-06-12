@@ -1,3 +1,7 @@
+# Matplotlib configuration for the paper figures: sets figure sizes matching
+# the IEEE Access column/text width, uses LaTeX text rendering and loads the
+# same math notation (notation.tex) as the paper so that axis labels like
+# $M$, $B$ match the manuscript. Imported by the visualization_* scripts.
 import matplotlib as mpl
 
 # In Latex, determine text and column width with:

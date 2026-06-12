@@ -1,10 +1,55 @@
+# %%
+"""Core optimization module: builds and solves the workflow placement problem.
+
+This implements the mixed-integer nonlinear program (MINLP) of Eq. (1) in
+"Large-scale workflow placement in serverless computing using integer
+nonlinear programming" (Adamek et al.). One call of solve_opt() places a
+single workflow (with all its deployments) on one set of nodes - either a
+regional subproblem of the decomposition (Sec. III-C) or the full
+centralized architecture, depending on the cloud config that is passed in.
+"""
 from gurobipy import *
 import numpy as np
 from typing import Any, Dict
 import time
 
-
+# %%
 def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, Any], gap=0,w_1=1,w_2=1,w_3=1,provider_name_list=[],provider_cost_list=[],heuristic=False):
+    """Solve the placement + selection problem (Eq. (1) of the paper) with Gurobi.
+
+    Parameters
+    ----------
+    deployment_workflow : dict
+        Workflow description (functions with time/ram/speedup/data attributes,
+        parallel paths/branches, number of deployments, input/output functions,
+        possibly a fixed "selection_list" and "function_set" inherited from the
+        upper decomposition level).
+    deployment_cloud : dict
+        Node description ("providers"): per node its provider name, latency row,
+        RAM capacity, request rate, current utilization and pricing.
+    gap : float
+        Gurobi MIPGap (0 = solve to optimality).
+    w_1, w_2, w_3 : float
+        Weights of the monetary cost M, basic time cost B and utilization cost U
+        in the weighted-sum objective of Eq. (1).
+    provider_name_list, provider_cost_list :
+        Global provider names and their pricing (used for data-dependency
+        storage-transfer costs that reference providers by name).
+    heuristic : bool
+        If True, skip optimization and use the baseline heuristic that places
+        every function (and selects every workflow) on node 0, i.e. the first
+        cloud provider (Sec. IV-C).
+
+    Returns
+    -------
+    model, P, H, L, T, C, D, D_in, Time, a, b, Speed, S, t, M
+        The Gurobi model, the solution matrices (placement P, selection H,
+        branch times T, bilinear data-transfer costs S, node utilizations M),
+        the model parameters (latencies L, execution costs C, data-transfer
+        costs D, input-data costs D_in, execution times "Time", successor
+        matrix a, branch membership b, speedup factors Speed) and the wall-clock
+        solve time t.
+    """
 
     workflow_functions = list(deployment_workflow['functions'].keys())
     providers = list(deployment_cloud['providers'].keys())
@@ -12,6 +57,8 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
     num_leaves = deployment_cloud['num_leaves']
     num_workflows = deployment_workflow['deployment_number']
     num_functions = len(deployment_workflow['functions'])
+    # Count cloud nodes vs. edge nodes ("tinyfaas"). Edge nodes are free but
+    # RAM-limited; cloud nodes cost money but offer a speedup (Sec. II-B).
     num_nodes_cloud = 0
     num_nodes_tiny = 0
     for key in deployment_cloud['providers'].keys():
@@ -26,27 +73,33 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
     model= Model("FaaS")
     if gap>0:
         model.setParam('MIPGap', gap)
-    C=np.zeros((num_functions,num_nodes))
-    D=np.zeros((num_functions, num_nodes,num_nodes))
-    L=np.zeros((num_nodes, num_nodes))
-    b=np.zeros((num_paths,num_functions))
-    a=np.zeros((num_functions,num_functions))
-    Speed=np.ones((num_functions, num_nodes))
-    ram_max=np.ones((num_nodes,1))*1e8
-    request=np.zeros((num_nodes,1))
-    ram=np.zeros((num_functions,1))
-    Time=np.zeros((num_functions,1))
+    # Model parameters (cf. Table 1 of the paper):
+    C=np.zeros((num_functions,num_nodes))         # C_{m,i}: cost to execute function m on node i
+    D=np.zeros((num_functions, num_nodes,num_nodes))  # D_{m,i,j}: cost to send output of m from node i to node j
+    L=np.zeros((num_nodes, num_nodes))            # L_{i,j}: latency between nodes i and j
+    b=np.zeros((num_paths,num_functions))         # b_{c,m}: function m belongs to branch/path c
+    a=np.zeros((num_functions,num_functions))     # a_{m,m~}: function m~ directly succeeds function m
+    Speed=np.ones((num_functions, num_nodes))     # x_{i,m}: execution-time factor of m on node i (<1 = speedup on cloud)
+    ram_max=np.ones((num_nodes,1))*1e8            # RAM_max,i: node RAM capacity (effectively inf for cloud nodes)
+    request=np.zeros((num_nodes,1))               # lambda_k: request rate of each leaf (user) node
+    ram=np.zeros((num_functions,1))               # RAM_m: memory usage of function m
+    Time=np.zeros((num_functions,1))              # t_func,m: base execution time of function m
     #prob_request=np.zeros((num_functions,1))
-    D_in=np.zeros((num_nodes,1))
+    D_in=np.zeros((num_nodes,1))                  # cost of receiving the workflow input data d_in on node i
+    # Indices of the first (input-receiving) and last (output-sending) functions
+    # of the workflow; they incur the user<->node latency and data costs.
     input_list=deployment_workflow['input_functions']
     m_start=[list(deployment_workflow['functions']).index(func) for func in input_list]
     end_list=deployment_workflow['output_functions']
     m_end=[list(deployment_workflow['functions']).index(func) for func in end_list]
     leave_nodes=[]
+    # Cloud nodes execute functions faster: apply the function's speedup factor
+    # (edge/tinyfaas nodes keep the base time, factor 1).
     for m in range(num_functions):
         for i in range(num_nodes):
             if deployment_cloud['providers'][f"provider_{i}"]['name']!="tinyfaas":
                 Speed[m,i]=deployment_workflow["functions"][f"function_{m}"]['speedup']#+deployment_cloud["providers"][f"provider_{i}"]['speedup']
+    # Leaf nodes are the user-facing nodes from which requests originate.
     for r in range(len(deployment_cloud['providers'])):
         if deployment_cloud['providers'][f"provider_{r}"]['leave']:
             leave_nodes.append(r)
@@ -56,18 +109,26 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
     #    list_func=deployment_workflow['workflow_dependencies'][func_name]
     #    indices = [list(deployment_workflow['functions']).index(func) for func in list_func]
     #    a[m,indices]=1
+    # Build branch membership b and successor matrix a from the parallel paths
+    # of the workflow DAG (Fig. 2 in the paper).
     for s in range(num_paths):
         list_func=deployment_workflow['paths'][str(s)]
         indices= [list(deployment_workflow['functions']).index(f"function_{func}") for func in list_func]
         b[s,indices]=1
         for r in range(len(list_func)-1):
             a[list_func[r],list_func[r+1]]=1
+    # Only edge (tinyfaas) nodes have a finite RAM budget left.
     for i in range(num_nodes):
         if deployment_cloud['providers'][f"provider_{i}"]["name"]=='tinyfaas':
 
             ram_max[i]=deployment_cloud['providers'][f"provider_{i}"]['max_RAM_curr']
+    # Request rate lambda_k of every leaf; in subproblems of the decomposition
+    # this already aggregates the rates of the underlying region (Eqs. (2)/(7)).
     for k in range(num_leaves):
         request[k]=deployment_cloud['providers'][f"provider_{leave_nodes[k]}"]["request_rate"]
+    # Assemble the per-function cost parameters C, D and D_in from the node
+    # pricing (cf. Sec. II-B: C_{m,i} = p_RAM,i*R_func,m + p_data,i*d_data,m and
+    # D_{m,i,j} = (p_send,i + p_send,j)*d_sent,m).
     for j in range( num_functions):
         ram[j] =  deployment_workflow['functions'][ workflow_functions[j]]['ram']
         Time[j] =  deployment_workflow['functions'][ workflow_functions[j]]['time']
@@ -76,6 +137,8 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         #prob_request[j]= deployment_workflow['functions'][ workflow_functions[j]]['prob_request']
         data_send = deployment_workflow['functions'][ workflow_functions[j]]['data_send']
         for k in range( num_nodes):
+            # Receiving the user's input data is free on edge nodes, priced per
+            # MB on cloud nodes.
             if deployment_cloud['providers'][f"provider_{k}"]["name"]=='tinyfaas':
                 #D[j,k]=0
                 D_in[k]=0
@@ -83,6 +146,8 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
                 pricing_data_sent = deployment_cloud['providers'][providers[k]]['pricing_data_sent']
                 #D[j,k]=prob_request[j]*data_send*pricing_data_sent
                 D_in[k]=deployment_workflow['input_data']*pricing_data_sent
+            # Data transfer between two nodes of different providers costs the
+            # sender's plus the receiver's egress price (free for tinyfaas).
             for m in range(num_nodes):
 
                     if deployment_cloud['providers'][f"provider_{k}"]["name"]!=deployment_cloud['providers'][f"provider_{m}"]["name"]:
@@ -94,6 +159,9 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
                             pricing_data_sent = deployment_cloud['providers'][providers[m]][
                             'pricing_data_sent']
                             D[j,k,m]=D[j,k,m]+data_send*pricing_data_sent #*prob_request[j]
+            # Dependency data stored at provider "key" must be transferred if
+            # function j runs on a node of a different provider
+            # (p_dependencies * d_dependencies, Sec. II-A).
             for key in data_dependencies.keys():
                 value = data_dependencies[key]
                 #provider_name=provider_name_list[int(key[9:])]
@@ -102,6 +170,8 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
                 if key!=  deployment_cloud["providers"][providers[k]]["name"]:
             #        D[j,k]=data_send
                     C[j,k]=C[j,k]+pricing_Storage_Transfer*value
+            # Direct execution cost: RAM-seconds (R_func,m = RAM_m * t_func,m)
+            # priced per provider; execution on edge nodes is free.
             if deployment_cloud['providers'][f"provider_{k}"]["name"]=='tinyfaas':
                 C[j,k]+=0
             else:
@@ -109,6 +179,7 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
                 #pricing_StartRequest =  deployment_cloud['providers'][ providers[k]]['pricing_StartRequest']
                 C[j,k]+=pricing_RAM*ram[j]*Time[j]#Speed#prob_request[j]*#+pricing_StartRequest*requests
 
+    # Pairwise node latencies L_{i,j} as estimated in the cloud config.
     for k in range( num_nodes):
         for m in range( num_nodes):
             L[k,m]= deployment_cloud['providers'][f"provider_{k}"]['estimated_latency'][m]
@@ -126,6 +197,9 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
     #w_2=1
     #w_3=1
     if heuristic:
+        # Baseline heuristic (Sec. IV-C): place every function of every
+        # deployment on node 0 (the first cloud provider) and let every leaf
+        # select the first deployment. No optimization is solved.
         t1=time.time()
         P_list = []
         # for model in  model_list:
@@ -145,6 +219,15 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         t=t2-t1
 
     else:
+        # Decision variables of Eq. (1) (deployments are indexed n, functions m,
+        # nodes i; rows of P/S/p are flattened as m + n*num_functions):
+        #   P[m+n*F, i] : binary placement P_{n,m,i} - function m of deployment n on node i
+        #   S[m+n*F, i] : continuous bilinear helper S_{n,m,i} - monetary cost of sending
+        #                 the output of function m from node i to its successors' nodes
+        #   H[k, n]     : binary selection H_{k,n} - leaf (user) k requests deployment n
+        #   T[n]        : evaluation time of deployment n (>= every branch time T_{n,c})
+        #   M[i]        : RAM utilization M_i of node i (penalized quadratically)
+        #   p[m+n*F]    : function utilization u_{n,m} (penalized quadratically)
         P=model.addVars( num_functions* num_workflows, num_nodes,vtype=GRB.BINARY, name="P")
         S = model.addVars(num_functions * num_workflows, num_nodes, vtype=GRB.CONTINUOUS, name="S")
         H=model.addVars(num_leaves,num_workflows,vtype=GRB.BINARY, name="H")
@@ -152,6 +235,10 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         M = model.addVars(num_nodes, vtype=GRB.CONTINUOUS, name="M")
         p = model.addVars(num_functions*num_workflows,vtype=GRB.CONTINUOUS,name="p")
         obj=0
+        # Expected-cost part of the objective: every term is weighted by the
+        # request rate lambda_k and the selection H_{k,n} of the requesting leaf.
+        # w_2 * T[n] is the basic time cost B; w_1 * (C + S) is the monetary
+        # cost M of executing functions and transferring data between them.
         for n in range( num_workflows):
             for k in range( num_leaves):
                 obj=obj+request[k][0]*H[k,n]*w_2*T[n]
@@ -161,12 +248,22 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
                         #for m_s in range(num_functions):
                             #for j in range(num_nodes):
                                 #obj=obj+H[k,n]*P[m+n*num_functions,i]*P[m_s+n*num_functions,j]*D[m,i]*a[m,m_s]
+        # "Virtual placements" of the decomposition (Eq. (3) of the paper):
+        # functions that the upper level placed OUTSIDE this region are pinned
+        # to node 0 (the head node), because all communication to other regions
+        # is routed through it. They are remembered in already_placed so that
+        # they can be excluded from the head node's utilization below (Eq. (4)).
         already_placed=np.zeros((num_workflows,num_functions))
         for m in range(num_functions):
             func_set=deployment_workflow["functions"][f"function_{m}"]["function_set"]
             for n in func_set:
                 model.addConstr(P[n*num_functions+m,0]==1,"Already placed workflow functions")
                 already_placed[n,m]+=1
+        # User <-> workflow communication terms: the first function(s) m_start
+        # receive the input data d_in from the requesting leaf (cost D_in plus
+        # leaf-to-node latency), the last function(s) m_end send the result back
+        # (cost D plus node-to-leaf latency). Cf. the P_{n,m_start,i} D_in,i and
+        # P_{n,m_end,i} D_{m,i,k} / L terms in Eq. (1).
         for n in range( num_workflows):
             for k in range( num_leaves):
                 for i in range(num_nodes):
@@ -176,10 +273,18 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
                         obj= obj+request[k][0]*H[k,n]*(w_1*D[m,i,k]*P[n*num_functions+m, i]+w_2*L[leave_nodes[k], i] * P[n*num_functions+m, i])
 
 
+        # Function utilization u_{n,m} = sum_k lambda_k H_{k,n} P_{n,m,i} t_{m,i}
+        # (expected busy time of one function deployment); its square is added
+        # to the objective with weight w_3 to discourage funnelling all requests
+        # through the same function instance (reduces blocking/waiting time).
         for n in range(num_workflows):
             for m in range(num_functions):
                 model.addConstr(p[n*num_functions+m]==quicksum(quicksum(request[k][0]*H[k,n]*P[n*num_functions,i]*Time[m]*Speed[m][i] for k in range(num_leaves)) for i in range(num_nodes)))
                 obj+=w_3*p[n*num_functions+m]**2
+        # Node utilization M_i (share of RAM_max,i expected to be occupied,
+        # on top of the utilization left by previously placed workflows).
+        # For the head node i=0 the RAM of virtually placed functions is
+        # subtracted again, since they actually run in another region (Eq. (4)).
         for i in range(num_nodes):
             curr_util=deployment_cloud["providers"][f"provider_{i}"]["utilization"]
 
@@ -192,16 +297,23 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
                     range(num_leaves)) for n in range(num_workflows)))/ram_max[i]+curr_util,
                                 "Aux cons")
             obj+=w_3*M[i]**2#quicksum(H[r,n]*M[i,n] for r in range(num_leaves))
+        # The three penalty/cost groups above form the utilization cost U of Eq. (1).
         #for k in range(num_nodes):
         #    obj+=w_3*quicksum(quicksum(P[n*num_functions+m,k] for m in range(num_functions)) for n in range(num_workflows))**2
         #for n in range(num_workflows):
         #    obj+=w_3*quicksum(H[k,n] for k in range(num_leaves))**2
         model.setObjective(obj,GRB.MINIMIZE)
         #T_path=np.zeros((num_workflows,num_paths))
+        # Placement constraint of Eq. (1): every function of every deployment
+        # is placed on exactly one node (sum_i P_{n,m,i} = 1).
         for n in range( num_workflows):
             for m in range( num_functions):
                 model.addConstr(quicksum(P[m+n* num_functions,i] for i in range( num_nodes))==1,"only one placed")
 
+        # Selection constraints: in lower-level subproblems the workflow choice
+        # was already made by the upper level (Eqs. (5)/(6)), so the inherited
+        # selection_list pins H; otherwise (top level / centralized problem)
+        # every leaf freely selects exactly one deployment (sum_n H_{k,n} = 1).
         if deployment_workflow["selection_list"]!={}:
             #if deployment_workflow["selection_list"] != [-1]:
             #    for k in range(num_leaves-1):
@@ -218,10 +330,17 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         #    model.addConstr(quicksum(H[k,n] for k in range( num_leaves))>=1,"place differently")
         #for i in range( num_nodes):
         #    model.addConstr(quicksum(quicksum(P[n*num_functions+m,i]*ram[m] for m in range(num_functions)) for n in range(num_workflows))<= ram_max[i] #*prob_request , "RAM_constraint")
+        # Maximum-branch-time constraint of Eq. (1): for every branch c the
+        # evaluation time T_n must cover the branch's execution times
+        # (Speed*Time) plus the latencies between consecutively placed
+        # functions. The product P*P of two placement variables makes the
+        # problem bilinear (hence an integer *nonlinear* program).
         for n in range(num_workflows):
             for s in range(num_paths):
                 model.addConstr(T[n]>=quicksum(quicksum(quicksum(quicksum(P[n*num_functions+m,i]*P[n*num_functions+m_s,j]*L[i,j]*a[m,m_s]*b[s,m] for m_s in range(num_functions)) for j in range(num_nodes))+P[n*num_functions+m,i]*b[s,m]*Speed[m,i]*Time[m] for m in range(num_functions)) for i in range(num_nodes)),'Time constraint')#=quicksum(quicksum(L[leave_nodes[k],i]*P[n*num_functions+m,i] for k in range(num_leaves)) for m in m_start)+quicksum(quicksum(L[leave_nodes[k],i]*P[n*num_functions+m,i] for k in range(num_leaves)) for m in m_end)#quicksum(quicksum(P[n*num_functions+m,i]*P[n*num_functions+m_s,j]*L[i,j]*a[m,m_s] for m_s in range(num_functions)) for j in range(num_nodes))*b[s,m]+
 
+        # Monetary bilinear helper of Eq. (1): S_{n,m,i} equals the data-transfer
+        # cost D_{m,i,j} to every direct successor m_s of m placed on node j.
         for n in range(num_workflows):
             for m in range(num_functions):
                 for i in range(num_nodes):
@@ -238,6 +357,10 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         # for model in  model_list:
         t1=time.time()
         try:
+            # Solve the MINLP and copy the flat Gurobi variable vector back into
+            # numpy arrays. Variables appear in the order they were added to the
+            # model (P, S, H, T, M, p), so the running index r/s walks through
+            # each block row-by-row.
             model.optimize()
 
             t2=time.time()

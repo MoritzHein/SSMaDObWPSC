@@ -1,3 +1,22 @@
+# Online selection simulation (Sec. IV-A/IV-B of the paper).
+#
+# Usage: selection_simulation.py --num_run=<N>  (after placement.py --num_run=<N>)
+#
+# Evaluates the placement computed by placement.py by simulating user requests:
+# requests arrive at every edge leaf with Poisson rate lambda_k over
+# "simulation_time" seconds and are executed FIFO on the placed nodes. Two
+# blocking mechanisms are modeled: a function deployment cannot serve two
+# requests at once, and a node whose RAM is fully occupied cannot start
+# further functions. The accumulated waiting time W (delay beyond the ideal
+# branch time base_T), the monetary cost M and the basic time cost B yield the
+# overall cost C = w_1*M + w_2*(B+W) used in the case study. If "comparison"
+# is set, the same simulation is repeated for the centralized/heuristic
+# solution (opt_<w>_full.json) and stored as overall_cost_comparison.
+#
+# The first half of the script evaluates the DECOMPOSED solution: because each
+# subproblem only knows its own region, the end-to-end placement has to be
+# reconstructed by following each function from the top-level problem down the
+# hierarchy (reconstruct_full_solution / upward_trajectory).
 import json
 import numpy as np
 import argparse
@@ -37,10 +56,17 @@ if __name__ == "__main__":
         predecessor_list=cloud_general_config["predecessor_list"]
         num_nodes_in_level_list=cloud_general_config["num_nodes_in_level"]
         num_other=len(provider_list[-1])-num_leaves
+        # ind_start_list[l] = index of the first subproblem of level l in the
+        # flat opt_<workflow>_<subproblem>.json numbering used by placement.py.
         ind_start_list=[0]
         for value in predecessor_list:
                 ind_start_list.append(len(value)+ind_start_list[-1])
 
+        # Walk from a physical node (usually a leaf) up through the hierarchy.
+        # Returns, per level: the region index (pred_k_list), the latency from
+        # the region's head node to the node (lat_upward_list) and the node's
+        # local position inside its region (pos_list). Used to compose
+        # end-to-end latencies across regions (Algorithm 1 of the paper).
         def upward_trajectory(leave_k):
 
                 pos_list=[]
@@ -76,6 +102,9 @@ if __name__ == "__main__":
 
                 return pred_k_list,lat_upward_list,pos_list
 
+        # Given the subproblem opt_num of level r-1 and the node selected_place
+        # chosen there, return the index of the level-r subproblem that refines
+        # this node (i.e. descend one level in the decomposition tree).
         def find_opt(opt_num,selected_place, r):
                 prev_value=opt_num - ind_start_list[r-1]
                 if prev_value>0:
@@ -85,9 +114,14 @@ if __name__ == "__main__":
                         return selected_place+ind_start_list[r]+num_curr_nodes
                 else:
                         return selected_place + ind_start_list[r]
+        # Map a deployment index of the parent problem to the row index in a
+        # subproblem, where pruned deployments were removed
+        # (active_workflow_list keeps the surviving parent indices in order).
         def find_correct_workflow(curr_selected_workflow,workflow_list):
                 index=workflow_list.index(curr_selected_workflow)
                 return index
+        # Convert a node chosen in last-level subproblem opt_num into its
+        # global physical node index (offset by all preceding regions' nodes).
         def get_leaf(selected_place,opt_num):
                 num_curr_nodes=0
 
@@ -97,6 +131,8 @@ if __name__ == "__main__":
                 return num_curr_nodes
 
 
+        # ---- Simulation setup: request rate lambda_k of every (workflow, leaf)
+        # pair, taken from the physical leaves of the flattened architecture.
         np.random.seed(42)
         sim_time = parameter_general_config["simulation_time"]
         time_cost_all = 0
@@ -114,6 +150,8 @@ if __name__ == "__main__":
                         request_rates[t, k] = cloud_config["providers"][f"provider_{k + num_other}"]["request_rate"]
         requests = np.zeros((sim_time, num_workflows, num_leaves))
 
+        # RAM capacity per physical node: only edge (tinyfaas) nodes are
+        # limited; cloud nodes never block due to RAM.
         cloud_full_path = os.path.join(f"cloud/run_{num_run}", "requirements_cloud_full.json")
         with open(cloud_full_path, 'r') as f:
                 cloud_full = json.load(f)
@@ -126,6 +164,12 @@ if __name__ == "__main__":
 
 
 
+        # Reassemble a global placement/selection (P_full, H_full on physical
+        # nodes) for workflow w from the per-level subproblem solutions: start
+        # at the top-level problem, read which deployment each leaf's region
+        # selected (H of opt_<w>_0), then follow every function's placement
+        # down the decomposition tree with find_opt until the physical level,
+        # converting the final choice to a global node index with get_leaf.
         def reconstruct_full_solution(w):
 
                 wf_path = os.path.join(f"workflows/run_{num_run}", f"requirements_workflow_{w}_0.json")
@@ -278,6 +322,11 @@ if __name__ == "__main__":
                 return {'P': P_full, 'H': H_full, 'L': L_full, 'a': a_full, 'b': b_full}
 
 
+        # ---- Precompute, for every (workflow w, leaf), the static execution
+        # plan of the decomposed solution: which deployment the leaf uses,
+        # on which physical node each function runs (selected_places), its
+        # rounded execution duration (cloud speedup applied) and RAM demand.
+        # This per-workflow table (perwf) drives the event simulation below.
         for w in range(num_workflows):
                 wf_path = os.path.join(f"workflows/run_{num_run}", f"requirements_workflow_{w}_0.json")
                 sol_path = os.path.join(f"placement/run_{num_run}", f"opt_{w}_full.json")
@@ -359,6 +408,11 @@ if __name__ == "__main__":
                 except Exception:
                         perwf[w]['num_paths'] = 0
 
+        # ---- Discrete-event simulation state (decomposed solution):
+        # node_active[i] holds the currently running executions on node i as
+        # tuples (end_time, ram, deployment, function_idx[, req_id], workflow);
+        # waiting_acc accumulates the waiting time W per (workflow, leaf);
+        # per_node_util / ram_area record the RAM occupancy over time.
         curr_utilization = np.zeros((num_nodes_global, 1))
 
         node_active = [[] for _ in range(num_nodes_global)]
@@ -377,6 +431,13 @@ if __name__ == "__main__":
 
         rng = np.random.default_rng(42)
 
+        # Simulate second by second: sample Poisson arrivals for every
+        # (workflow, leaf) pair, then execute them under the two blocking
+        # rules (RAM capacity and one-request-per-function-deployment).
+        # Two scheduling variants exist: "lazy_start" keeps a pending queue and
+        # advances requests step-wise in real time; the default variant
+        # resolves each request immediately by searching the next free slot
+        # (jumping curr_time to the earliest finishing execution if blocked).
         for cur_t in range(sim_time):
 
                 requests[cur_t] = rng.poisson(request_rates)
@@ -405,6 +466,10 @@ if __name__ == "__main__":
                                         Lmat = info['L']
                                         deployment_id = int(info.get('deployment', w))
 
+                                        # base_T = ideal (blocking-free) evaluation time of the
+                                        # workflow: the slowest branch's sum of function durations
+                                        # plus inter-node latencies (= T_n of the placement model).
+                                        # Waiting time is measured as delay beyond base_T.
                                         base_T_paths = []
                                         a_mat = perwf[w].get('a', [])
                                         b_mat = perwf[w].get('b', [])
@@ -428,6 +493,8 @@ if __name__ == "__main__":
                                                 base_T_paths.append(tot)
                                         base_T = max(base_T_paths) if base_T_paths else 0
 
+                                        # Enqueue n new requests; they progress function by
+                                        # function (next_idx) in later time steps.
                                         for i in range(n):
                                                 req = {
                                                         'id': int(req_id_counter),
@@ -448,6 +515,9 @@ if __name__ == "__main__":
                                                 req_id_counter += 1
 
 
+                        # Advance every pending request by at most one function start
+                        # per time step. Finished requests (all functions done) are
+                        # logged with their waiting time wait = makespan - base_T.
                         still_pending = []
                         for req in pending_requests:
                                 w = req['workflow']
@@ -489,6 +559,9 @@ if __name__ == "__main__":
                                         continue
 
 
+                                # The next function may only start once the previous one
+                                # has finished and its output has been transferred
+                                # (predecessor end time + latency must have passed).
                                 ready = False
                                 if idx == 0:
                                         ready = True
@@ -512,6 +585,9 @@ if __name__ == "__main__":
                                         continue
 
 
+                                # Blocking check (Sec. IV-A): start the function only if
+                                # the node has enough free RAM and this function of this
+                                # deployment is not already serving another request.
                                 node = sel_places[idx]
                                 dur = durs[idx]
                                 ram_req = rams[idx]
@@ -540,6 +616,7 @@ if __name__ == "__main__":
                         pending_requests = still_pending
 
 
+                        # Record the RAM occupied on every node in this time step.
                         for ni in range(num_nodes_global):
                                 used_now = sum(entry[1] for entry in node_active[ni] if entry[0] > cur_t)
                                 ram_area[ni] += used_now
@@ -586,6 +663,10 @@ if __name__ == "__main__":
                                         base_T = max(base_T_paths) if base_T_paths else 0
 
 
+                                        # Resolve each arriving request immediately: walk every
+                                        # branch function-by-function, booking each execution at
+                                        # the earliest time slot that satisfies the RAM and
+                                        # function-busy blocking rules.
                                         for i in range(n):
                                                 arrival = cur_t
                                                 path_finish_times = []
@@ -602,6 +683,10 @@ if __name__ == "__main__":
                                                                 dur = durs[idx_m]
                                                                 ram_req = rams[idx_m]
 
+                                                                # Find the earliest start time: if blocked, jump
+                                                                # to the next finishing execution on the node and
+                                                                # re-check (this waiting is the simulated cost of
+                                                                # the blocking mechanisms).
                                                                 while True:
 
                                                                         used = sum(
@@ -634,6 +719,9 @@ if __name__ == "__main__":
 
                                                                 node_active[node].append((endt, ram_req, deployment_id, idx_m,w))
 
+                                                                # Move on to the successor: execution end plus the
+                                                                # transfer latency to the next function's node (or
+                                                                # back to the requesting leaf after the last one).
                                                                 idx_pos = func_nums.index(idx_m)
                                                                 if idx_pos < len(func_nums) - 1:
                                                                         next_m = func_nums[idx_pos + 1]
@@ -646,6 +734,8 @@ if __name__ == "__main__":
                                                                         transfer = 0
                                                                 curr_time = endt + transfer
                                                         path_finish_times.append(curr_time)
+                                                # Request completes when its slowest branch returns;
+                                                # everything beyond base_T counts as waiting time W.
                                                 req_done = max(path_finish_times) if path_finish_times else arrival
                                                 req_done_list.append(req_done-arrival)
                                                 wait = (req_done - arrival) - base_T
@@ -673,10 +763,18 @@ if __name__ == "__main__":
                                 ram_area[ni] += used_now
                                 per_node_util[cur_t, ni] = used_now
 
+        # ---- Monetary/time cost evaluation of the decomposed solution: weight
+        # the per-request costs by the number of requests actually sampled.
         overall_requests = np.zeros((num_workflows, num_leaves))
         for t in range(num_workflows):
                 for k in range(num_leaves):
                         overall_requests[t, k] = sum(requests[:, t, k])
+        # For every workflow t and leaf k, recompute the exact monetary cost
+        # (execution C, data transfer D, dependency storage transfer, input
+        # data D_in) and the branch times of the decomposed placement by
+        # following each function down the hierarchy, exactly mirroring the
+        # cost terms of Eq. (1). Latencies across regions are composed with
+        # upward_trajectory (Algorithm 1).
         select_cost_all=0
         for t in range(num_workflows):
                 select_cost=0
@@ -705,6 +803,8 @@ if __name__ == "__main__":
                 placement_overall=0
                 for k in range(num_leaves):
 
+                        # Which deployment serves this leaf: read the selection H of
+                        # the top-level problem for the leaf's level-1 region.
                         pred_k_list, lat_upward_list,pos_list = upward_trajectory(k+num_other)
 
                         selected_workflow = H[
@@ -726,6 +826,10 @@ if __name__ == "__main__":
 
                                 func_nums = np.where(np.array(b[s])==1)[0].tolist()
 
+                                # Trace function m through all levels of the decomposition
+                                # (r=0 is the top problem); costs/latencies are accumulated
+                                # per level, the physical execution node is reached at the
+                                # last level.
                                 for m in func_nums:
                                         prev_selected_place = 0
                                         opt_num=0
@@ -758,6 +862,11 @@ if __name__ == "__main__":
                                                         selected_place=curr_P[curr_selected_workflow*num_functions+m].index(1)
 
                                                 if r==0:
+                                                        # Top level: dependency-data transfer cost (if the
+                                                        # function does not run at the provider storing its
+                                                        # data), latency from the user's region, input-data
+                                                        # cost D_in for the first function and output-transfer
+                                                        # cost D towards the successor's node.
                                                         data_dependencies = curr_workflow['functions'][f"function_{m}"][
                                                                 'data_dependencies']
                                                         for key in data_dependencies.keys():
@@ -784,6 +893,10 @@ if __name__ == "__main__":
                                                         D_func[m]=D[m][selected_place][next_selected_place]
 
                                                 else:
+                                                        # Lower levels: if the user's trajectory passes through
+                                                        # the same region, add the intra-region latency;
+                                                        # otherwise route via the head nodes (latency to the
+                                                        # own head node plus the user's upward latency).
                                                         if pred_k_list[r]==opt_num-ind_start_list[r]:
 
                                                                 with open(placement_path, "r") as f:
@@ -797,6 +910,9 @@ if __name__ == "__main__":
                                                                 L_func[m] += lat_upward_list[r]
 
 
+                                                # Physical level reached: add execution time (cloud
+                                                # speedup applied) and RAM-seconds execution cost on
+                                                # the actually chosen node.
                                                 if r == num_levels-1:
                                                         if curr_cloud['providers'][f"provider_{selected_place}"][
                                                                 "name"] == "tinyfaas":
@@ -819,6 +935,9 @@ if __name__ == "__main__":
 
                                                 prev_selected_place = selected_place
                                         pred_k_list,lat_upward_list,pos_list=upward_trajectory(k_curr)
+                                # Latency for returning the branch's result from the last
+                                # function's node back to the requesting leaf, composed
+                                # across the hierarchy as in Algorithm 1.
                                 L_end=0
                                 pred_k_list_new, lat_upward_list_new, pos_list_new = upward_trajectory(k+num_other)
                                 for r in range(num_levels-1,-1,-1):
@@ -835,6 +954,9 @@ if __name__ == "__main__":
                                                 L_end += lat_upward_list[r]
                                 T_paths[s]+=L_end
 
+                        # Per-request costs: time = slowest branch, money = execution +
+                        # data transfer + input data; weighted by the simulated number
+                        # of requests of this (workflow, leaf) pair.
                         for r in range(num_nodes_all):
                                 placement_overall+=sum(placement_func[:,r])**2
                         time_cost+=np.max(T_paths)
@@ -849,6 +971,8 @@ if __name__ == "__main__":
                 select_cost=np.sum(workflow_overall**2)+np.sum(invocations**2)
                 select_cost_all+=select_cost
 
+        # Overall simulated cost C = w_1*M + w_2*(B+W): req_done_list holds the
+        # complete per-request response times (basic time + waiting).
         overall_cost = w_1 * money_cost_all+ w_2 * sum(req_done_list)
         print(sum(sum(waiting_acc)))
         print([overall_cost])
@@ -861,6 +985,13 @@ if __name__ == "__main__":
         results['complete_time_cost'] = sum(sum(waiting_acc))
         results['time_cost']=time_cost_all
 
+        # ================= Comparison run =================
+        # Repeat the identical simulation (same RNG seeds, hence the same
+        # request streams) for the centralized/heuristic solution stored in
+        # opt_<w>_full.json. The code mirrors the decomposed evaluation above,
+        # but P/H/L can be used directly since the comparison was solved on
+        # the flattened architecture - no hierarchy reconstruction is needed
+        # (reconstruct_full_solution only serves as fallback).
         if comparison:
                 np.random.seed(42)
                 sim_time=parameter_general_config["simulation_time"]
@@ -1027,6 +1158,8 @@ if __name__ == "__main__":
                                 wf_conf = {}
                                 node_conf = {}
 
+                        # The comparison solution is read directly from the full
+                        # (centralized/heuristic) placement file.
                         decomposed_mode = False
                         sol_conf = {}
                         if decomposed_mode:
@@ -1052,6 +1185,8 @@ if __name__ == "__main__":
                         Speed = sol_conf.get('Speed', None)
                         a = sol_conf.get('a', [])
                         b = sol_conf.get('b', [])
+                        # Count the shared start/finish functions in only one branch so
+                        # they are not executed once per branch in the simulation.
                         if len(b) > 1:
                                 for r in range(1, len(b)):
                                         b[r][0] = 0
@@ -1418,6 +1553,9 @@ if __name__ == "__main__":
                         for k in range(num_leaves):
                                 overall_requests[t,k]=sum(requests[:,t,k])
 
+                # Monetary/time cost evaluation of the comparison solution -
+                # same cost terms as for the decomposed case, but directly on
+                # the flat P/H/L matrices of the centralized placement.
                 for t in range(num_workflows):
 
                         cloud_name = f"requirements_cloud_full.json"
@@ -1537,6 +1675,8 @@ if __name__ == "__main__":
         results['overall_cost_comparison'] = overall_cost[0]
 
 
+        # Store the aggregated costs (results.json: used by the visualization
+        # scripts) and a detailed per-request / per-node trace of the run.
         with open(results_path, "w") as f:
                 json.dump(results, f, indent=4)
 

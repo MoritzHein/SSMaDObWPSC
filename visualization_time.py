@@ -1,3 +1,12 @@
+# Visualization of the decomposed-vs-CENTRALIZED scaling study (Sec. IV-C,
+# Table 3 of the paper).
+#
+# Usage: visualization_time.py --num_run=<N>  (figures saved to results/run_<N>/)
+#
+# Reads runs 126..128 (increasing node count, run via run_time_case_study.bat)
+# and plots (a) the computation time of the decomposed approach - summed over
+# its subproblems - against the centralized solve time and (b) the relative
+# cost gap g between both solutions.
 import scienceplots
 import matplotlib.pyplot as plt
 import sys
@@ -26,6 +35,9 @@ if __name__ == '__main__':
     num_weights=3
     num_workflows=10
     heuristic=False
+    # Average per-workflow solve times and simulated costs over the scaling
+    # runs: time_list[workflow][level][region] from placement.py is summed
+    # over all subproblems, comparison_time is the centralized solve time.
     for k in range(num_weights):
         import_path_time = os.path.join('results', f'run_{k+126}','time.json')
         with open(import_path_time, "r") as f:  # requirements_workflow_0.json
@@ -43,6 +55,7 @@ if __name__ == '__main__':
         print(f'Saving to folder {export_path}.')
     format_type = 'pgf'
 
+    # Computation time of both approaches over the number of nodes per region.
     fig,ax=plt.subplots(1,1,figsize=(config_mpl.textwidth, config_mpl.textwidth / config_mpl.golden_ratio),sharex="col")
     nodes=[k+2 for k in range(num_weights)]#
     #nodes=[30 * 10 ** k for k in range(num_weights)]
@@ -62,6 +75,7 @@ if __name__ == '__main__':
     fig.savefig(os.path.join(export_path, f'time_results_{num_run}.' + format_type), format=format_type)
     fig, ax = plt.subplots(1, 1, figsize=(config_mpl.textwidth, config_mpl.textwidth / config_mpl.golden_ratio),
                            sharex="col")
+    # Relative cost gap g [%] of the decomposed against the centralized cost.
     #nodes = [50*10**k for k in range(num_weights)]
     ax.plot(nodes, 100*(np.array(costs)-np.array(costs_comparison))/np.array(costs_comparison), label="decomposed")
 
