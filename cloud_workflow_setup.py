@@ -38,7 +38,54 @@ def update_cloud_config(requirements_cloud_config, requirements_workflow_config,
 # "selection_list" (Eq. (5)), and functions placed outside this region are
 # recorded per function in "function_set" so solve_opt can pin them to the
 # head node as virtual placements (Eq. (3)).
-def update_requirements_config(requirements_workflow_config, P,H, current_node,current_leave_k, num_nodes,seed=42):
+# Stochastic decomposition (Stage 2): given the parent selection matrix H
+# (rows = parent leaves, cols = parent deployments), the parent node this region
+# refines (current_node) and the local->parent deployment map (n_list), return
+# per-local-deployment targets:
+#   flow_rhs[l]        = lambda_rep * H_parent[rep, n_list[l]] -- the own-user
+#                        demand for deployment n that this region's real leaves
+#                        must reproduce (0 if the parent node is not a user leaf);
+#   outside_routing[l] = rate-weighted routing of the outside/virtual demand to
+#                        deployment n (a distribution over l).
+# NOTE: the parent-deployment column index used here is n_list[l]; the exact
+# cross-level deployment numbering must be validated empirically before the
+# optimizer consumes these (Stage 2a).
+def _stochastic_selection_targets(H, current_node, n_list, parent_cloud):
+    num_local = len(n_list)
+    flow_rhs = [0.0] * num_local
+    outside_routing = [0.0] * num_local
+    if parent_cloud is None or H is None or getattr(H, "shape", (0,))[0] == 0:
+        return flow_rhs, outside_routing
+    providers = parent_cloud["providers"]
+    ncols = H.shape[1]
+
+    def own_rate(j):
+        p = providers[f"provider_{j}"]
+        return float(p.get("request_rate", 0.0)) - float(p.get("virtual_request_rate", 0.0))
+
+    parent_leaves = [j for j in range(parent_cloud["num_nodes"])
+                     if providers[f"provider_{j}"].get("leave", False)]
+    leaf_pos = {j: i for i, j in enumerate(parent_leaves)}
+
+    if current_node in leaf_pos:
+        rep = leaf_pos[current_node]
+        lam_rep = own_rate(current_node)
+        for l, n in enumerate(n_list):
+            if 0 <= rep < H.shape[0] and 0 <= n < ncols:
+                flow_rhs[l] = lam_rep * float(H[rep][n])
+
+    others = [j for j in parent_leaves if j != current_node]
+    tot = sum(own_rate(j) for j in others)
+    if tot > 0:
+        for l, n in enumerate(n_list):
+            if 0 <= n < ncols:
+                outside_routing[l] = sum(
+                    own_rate(j) * float(H[leaf_pos[j]][n]) for j in others
+                    if leaf_pos[j] < H.shape[0]) / tot
+    return flow_rhs, outside_routing
+
+
+def update_requirements_config(requirements_workflow_config, P,H, current_node,current_leave_k, num_nodes,seed=42,parent_cloud_config=None,stochastic_selection=False):
     np.random.seed(seed)
     num_functions = requirements_workflow_config["num_functions"]
     num_workflows = requirements_workflow_config["deployment_number"]
@@ -47,24 +94,38 @@ def update_requirements_config(requirements_workflow_config, P,H, current_node,c
     if len(P) == 0:
         num_workflows = 0
     else:
-        # Keep only deployments n that have at least one function placed on
-        # this region's head node; reduce deployment_number accordingly.
-        for n in range(num_workflows):
-            if all(P[n * num_functions:(n + 1) * num_functions, current_node] == 0):
-                num_workflows -= 1
-            else:
+        # Which deployments stay active in this region. Deterministic: only those
+        # with a function on the head node. Stochastic: additionally keep every
+        # deployment any parent leaf routes to (H>0), so the flow-conservation
+        # policy is representable even if its functions all live elsewhere
+        # (they then become virtual placements via function_set below).
+        num_orig = num_workflows
+        for n in range(num_orig):
+            has_func_here = not all(P[n * num_functions:(n + 1) * num_functions, current_node] == 0)
+            selected = (H.shape[0] > 0 and sum(H[:, n]) > 0)
+            if has_func_here or (stochastic_selection and selected):
                 n_list.append(n)
-        # Deployments selected by at least one upper-level leaf stay selected
-        # for all users of this region (regional selection coupling).
-        for n in range(num_workflows):
-            if sum(H[:,n_list[n]])>0:
-                selection_list.append(n)
+            else:
+                num_workflows -= 1
+        if stochastic_selection:
+            # Stochastic policy propagation (Stage 2): instead of pinning a single
+            # deployment for the whole region, pass the per-deployment demand the
+            # real users of this region must reproduce (flow_rhs) and the routing
+            # of the outside/virtual demand (outside_routing). Both are indexed by
+            # the local (n_list) deployment order.
+            flow_rhs, outside_routing = _stochastic_selection_targets(
+                H, current_node, n_list, parent_cloud_config)
+            requirements_workflow_config["flow_rhs"] = flow_rhs
+            requirements_workflow_config["outside_routing"] = outside_routing
+            requirements_workflow_config["selection_list"] = {}
+        else:
+            # Deterministic: deployments selected by at least one upper-level leaf
+            # stay selected for all users of this region (regional coupling).
+            for n in range(num_workflows):
+                if sum(H[:,n_list[n]])>0:
+                    selection_list.append(n)
+            requirements_workflow_config["selection_list"]=selection_list
         requirements_workflow_config["active_workflow_list"]=n_list
-        #if current_leave_k==-1:
-        #    selection_list=[current_leave_k]
-        #else:
-        #    selection_list=H[current_leave_k,:].tolist()
-        requirements_workflow_config["selection_list"]=selection_list
         # function_set[m] = deployments whose function m was NOT placed on this
         # region's head node, i.e. it runs in another region and only appears
         # here virtually (communication enters through the head node).
@@ -355,7 +416,7 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
             num_clouds_in_level = 1
             num_nodes = num_nodes_in_level[k][0]  # np.random.randint(3,10)
             L = np.zeros((num_nodes, num_nodes))
-            rand_latencies = np.random.uniform(0, 1, (int(num_nodes * (num_nodes - 1) / 2), 1))
+            rand_latencies = np.random.uniform(lat_min / (base_decrease ** (k)), lat_max / (base_decrease ** (k)), (int(num_nodes * (num_nodes - 1) / 2), 1))
             ind = 0
 
             for r in range(num_nodes):
@@ -487,6 +548,12 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
                             "max_RAM_curr": ram[0],
                             "utilization": 0,
                             "request_rate":request[0]+request_overall,
+                            # Split of the head-node rate into the region's OWN user
+                            # share (request[0]) and the virtual/outside demand
+                            # (request_overall, the Eq. 7 placeholder). Stored so the
+                            # stochastic decomposition can treat node 0 as a normal
+                            # leaf for its own users and the virtual stream separately.
+                            "virtual_request_rate":request_overall,
                             "pricing_Storage_Transfer": provider_cost_list[provider_list[k][curr_node_level]]["pricing_Storage_Transfer"]+np.random.uniform(-provider_dev["pricing_Storage_Transfer"],provider_dev["pricing_Storage_Transfer"]),
                             "pricing_RAM": provider_cost_list[provider_list[k][curr_node_level]]["pricing_RAM"]+np.random.uniform(-provider_dev["pricing_RAM"],provider_dev["pricing_RAM"]),  # 2.5e-06,
                             "pricing_data_sent": provider_cost_list[provider_list[k][curr_node_level]]["pricing_data_sent"]+np.random.uniform(-provider_dev["pricing_data_sent"],provider_dev["pricing_data_sent"]),

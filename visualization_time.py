@@ -22,9 +22,16 @@ import config_mpl
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
     )
-    parser.add_argument("--num_run", required=True, type=int)
+    parser.add_argument("--num_run", required=False, type=int, default=None)
     args = parser.parse_args()
     num_run = args.num_run
+    if num_run is None:
+        while True:
+            try:
+                num_run = int(input("Please enter num_run: "))
+                break
+            except ValueError:
+                print("num_run must be an integer. Please try again.")
 
     # setup export path
     export_path = os.path.join('results',f'run_{num_run}')

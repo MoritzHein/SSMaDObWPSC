@@ -1,0 +1,140 @@
+# One-factor-at-a-time (OFAT) scale-sweep runner for the sensitivity study.
+#
+# Usage: run_scale_sweep.py --num_run=<N>
+#        (after placement.py --num_run=<N>)
+#
+# Complements run_sensitivity.py (which evaluates random combined scenarios).
+# Here each uncertain parameter is varied ALONE across a set of deterministic
+# scale factors while the others stay at their baseline, so the effect of every
+# individual uncertainty can be attributed cleanly. The script generates its own
+# scenarios (reusing the perturbation functions of
+# generate_sensitivity_scenarios.py) under sensitivity/run_<N>/scale_sweep/,
+# evaluates the fixed placement against each via selection_simulation.py, and
+# aggregates the costs into results/run_<N>/sensitivity/scale_sweep_summary.json
+# (consumed by visualization_sensitivity.py).
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+import numpy as np
+
+from generate_sensitivity_scenarios import perturb_cloud, perturb_workflows
+
+# The five uncertain parameters; request_rate/latency live in the cloud files,
+# time/speedup/ram in the workflow files.
+ALL_PARAMS = ["request_rate", "time", "speedup", "latency", "ram"]
+DEFAULT_FACTORS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+
+
+def load_json(path):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def factor_tag(f):
+    # Filesystem-friendly tag, e.g. 1.25 -> "1p25".
+    return ("%g" % f).replace(".", "p").replace("-", "m")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_run", required=False, type=int, default=None)
+    parser.add_argument("--factors", required=False, type=str, default=None,
+                        help="Comma-separated scale factors (default 0.5,0.75,1.0,1.25,1.5,2.0).")
+    parser.add_argument("--params", required=False, type=str, default=None,
+                        help="Comma-separated parameters to sweep (default all five).")
+    args = parser.parse_args()
+    num_run = args.num_run
+    if num_run is None:
+        while True:
+            try:
+                num_run = int(input("Please enter num_run: "))
+                break
+            except ValueError:
+                print("num_run must be an integer. Please try again.")
+
+    factors = ([float(x) for x in args.factors.split(",")] if args.factors
+               else list(DEFAULT_FACTORS))
+    params = ([p.strip() for p in args.params.split(",")] if args.params
+              else list(ALL_PARAMS))
+    for p in params:
+        if p not in ALL_PARAMS:
+            raise SystemExit(f"Unknown parameter '{p}'. Choose from {ALL_PARAMS}.")
+
+    cloud_dir = f"cloud/run_{num_run}"
+    workflow_dir = f"workflows/run_{num_run}"
+
+    # Baseline: evaluate the unperturbed placement once if not already present.
+    baseline_path = os.path.join("results", f"run_{num_run}", "results.json")
+    if not os.path.exists(baseline_path):
+        print("Baseline results missing; running selection_simulation.py once ...")
+        subprocess.run([sys.executable, "selection_simulation.py", f"--num_run={num_run}"],
+                       check=True)
+    baseline = load_json(baseline_path)
+
+    # rng is unused for scale mode (draw_factor is deterministic) but the
+    # perturbation functions expect one.
+    rng = np.random.default_rng(0)
+
+    sweep = {}
+    for param in params:
+        print(f"\n=== Sweeping {param} ===")
+        per_param = {"factors": [], "overall_cost": [], "overall_cost_comparison": []}
+        for f in factors:
+            sens = {p: {"mode": "off"} for p in ALL_PARAMS}
+            sens[param] = {"mode": "scale", "factor": f, "per_element": False}
+            out_dir = os.path.join("sensitivity", f"run_{num_run}", "scale_sweep",
+                                    param, f"factor_{factor_tag(f)}")
+            os.makedirs(out_dir, exist_ok=True)
+            manifest = {"num_run": num_run, "param": param, "factor": f, "config": sens}
+            # Only the matching family of files is written: perturb_cloud no-ops
+            # for workflow parameters and perturb_workflows no-ops for cloud ones.
+            perturb_cloud(rng, sens, cloud_dir, out_dir, manifest)
+            perturb_workflows(rng, sens, workflow_dir, out_dir, manifest)
+            with open(os.path.join(out_dir, "scenario_manifest.json"), "w") as fh:
+                json.dump(manifest, fh, indent=4)
+
+            print(f"  {param} x{f} ...")
+            subprocess.run(
+                [sys.executable, "selection_simulation.py",
+                 f"--num_run={num_run}", f"--scenario_dir={out_dir}"],
+                check=True)
+            res = load_json(os.path.join(out_dir, "results", "results.json"))
+            per_param["factors"].append(f)
+            per_param["overall_cost"].append(res.get("overall_cost"))
+            per_param["overall_cost_comparison"].append(res.get("overall_cost_comparison"))
+        sweep[param] = per_param
+
+    out_dir = os.path.join("results", f"run_{num_run}", "sensitivity")
+    os.makedirs(out_dir, exist_ok=True)
+    summary = {
+        "num_run": num_run,
+        "factors": factors,
+        "baseline": {
+            "overall_cost": baseline.get("overall_cost"),
+            "overall_cost_comparison": baseline.get("overall_cost_comparison"),
+            "money_cost": baseline.get("money_cost"),
+            "time_cost": baseline.get("time_cost"),
+            "complete_time_cost": baseline.get("complete_time_cost"),
+        },
+        "params": sweep,
+    }
+    out_path = os.path.join(out_dir, "scale_sweep_summary.json")
+    with open(out_path, "w") as f:
+        json.dump(summary, f, indent=4)
+    print(f"\nWrote {out_path}")
+    base_c = baseline.get("overall_cost")
+    print(f"baseline overall_cost = {base_c}")
+    for param in params:
+        costs = [c for c in sweep[param]["overall_cost"] if isinstance(c, (int, float))]
+        if costs:
+            print(f"  {param:13s} overall_cost range [{min(costs):.4g}, {max(costs):.4g}]")
+
+
+if __name__ == "__main__":
+    main()

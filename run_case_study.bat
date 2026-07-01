@@ -5,6 +5,6 @@
 :: the Python interpreter and script paths to your own checkout/venv.
 :: Visualize the results afterwards with: visualization.py --num_run=2
 for /l %%x in (2, 1,122) do (
-    C:\Users\smjsadam\Documents\2025-scheduling-workflows-faas\venv\Scripts\python.exe C:\Users\smjsadam\Documents\2025-scheduling-workflows-faas\placement.py --num_run=%%x
-    C:\Users\smjsadam\Documents\2025-scheduling-workflows-faas\venv\Scripts\python.exe C:\Users\smjsadam\Documents\2025-scheduling-workflows-faas\selection_simulation.py --num_run=%%x
+    C:\Users\smmzhein\AppData\Local\anaconda3\envs\OptiFaas\python.exe Z:\Documents\OptiFaas\IEA_LSWPISCUINP\placement.py --num_run=%%x
+    C:\Users\smmzhein\AppData\Local\anaconda3\envs\OptiFaas\python.exe Z:\Documents\OptiFaas\IEA_LSWPISCUINP\selection_simulation.py --num_run=%%x
 )

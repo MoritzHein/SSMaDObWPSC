@@ -22,9 +22,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Script that adds 3 numbers from CMD"
     )
-    parser.add_argument("--num_run", required=True, type=int)
+    parser.add_argument("--num_run", required=False, type=int, default=None)
     args = parser.parse_args()
     num_run=args.num_run
+    if num_run is None:
+        while True:
+            try:
+                num_run = int(input("Please enter num_run: "))
+                break
+            except ValueError:
+                print("num_run must be an integer. Please try again.")
 
     # Load the experiment parameters: objective weights w_1..w_3 (Eq. (1)),
     # architecture size (num_levels), number of workflows, provider pricing
@@ -47,6 +54,10 @@ if __name__ == "__main__":
     own_gap=parameter_general_config["own_gap"]
     config_random_workflows=parameter_general_config["config_random_workflows"]
     config_random_cloud=parameter_general_config["config_random_cloud"]
+    # Stage 1 of the stochastic-selection relaxation: when enabled, the
+    # centralized (comparison) solve treats H as a continuous routing policy.
+    # Absent => False => unchanged deterministic behavior.
+    stochastic_selection=parameter_general_config.get("stochastic_selection", False)
     # Sample the hierarchical serverless architecture: one cloud config file per
     # (level, region) pair plus a general_config.json describing the hierarchy.
     generate_cloud(num_levels,num_run=num_run,provider_name=provider_list,provider_dev=provider_dev,num_tiny_first=num_tiny_first,provider_cost_list=provider_cost_list,config_random_cloud=config_random_cloud,seed=seed)
@@ -108,9 +119,15 @@ if __name__ == "__main__":
                         requirements_workflow_config = json.load(f)
                     with open(path_predecessor, "r") as f:  # requirements_workflow_0.json
                         solution = json.load(f)
+                    # Parent region's cloud config (level k-1, region curr_node): its
+                    # per-leaf rates + selections feed the stochastic flow-conservation
+                    # RHS and the head-node outside-routing distribution.
+                    parent_cloud_path = os.path.join(f"cloud/run_{num_run}", f"requirements_cloud_{k-1}_{curr_node}.json")
+                    with open(parent_cloud_path, "r") as f:
+                        parent_cloud_config = json.load(f)
                     if requirements_cloud_config["providers"]["provider_0"]["name"]=="tinyfaas":
                         curr_leave_k+=1
-                    requirements_workflow_config=update_requirements_config(requirements_workflow_config,np.array(solution['P']),np.array(solution['H']),ind,curr_leave_k,requirements_cloud_config["num_nodes"],seed=seed)#P_list[predecessor_list[k][s]]
+                    requirements_workflow_config=update_requirements_config(requirements_workflow_config,np.array(solution['P']),np.array(solution['H']),ind,curr_leave_k,requirements_cloud_config["num_nodes"],seed=seed,parent_cloud_config=parent_cloud_config,stochastic_selection=stochastic_selection)#P_list[predecessor_list[k][s]]
                     with open(path_workflow, "w") as f:
                         json.dump(requirements_workflow_config, f, indent=4)
                 # Solve the regional placement subproblem (Eq. (1)) with Gurobi
@@ -140,6 +157,11 @@ if __name__ == "__main__":
                 # Remember the utilization this workflow adds to each node, so
                 # that the next workflow's placement sees the occupied capacity.
                 requirements_cloud_config=update_cloud_config(requirements_cloud_config,requirements_workflow_config,P,M)
+                # Persist the region latency matrix L (a node-to-node parameter,
+                # identical across workflows) alongside the node parameters so the
+                # simulation reads latency from the cloud config and the placement
+                # solution files stay immutable. See selection_simulation.py.
+                requirements_cloud_config["L"] = L.tolist()
                 with open(path_cloud, "w") as f:
                     json.dump(requirements_cloud_config, f, indent=4)
     t2=time.time()
@@ -166,7 +188,9 @@ if __name__ == "__main__":
             with open(path_workflow, "r") as f:  # requirements_workflow_0.json
                 requirements_workflow_config = json.load(f)
 
-            model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M = solve_opt(requirements_workflow_config, requirements_cloud_config,comparison_gap,w_1,w_2,w_3,provider_list,provider_cost_list,heuristic)
+            # Stochastic selection applies to the centralized optimization only
+            # (the heuristic forces a trivial one-hot H, so it is left untouched).
+            model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M = solve_opt(requirements_workflow_config, requirements_cloud_config,comparison_gap,w_1,w_2,w_3,provider_list,provider_cost_list,heuristic,relax_selection=(stochastic_selection and not heuristic))
             solution = dict()
             solution['P'] = P.tolist()
             solution['H'] = H.tolist()
@@ -181,6 +205,10 @@ if __name__ == "__main__":
             solution['Speed'] = Speed.tolist()
             solution['S'] = S.tolist()
             requirements_cloud_config = update_cloud_config(requirements_cloud_config, requirements_workflow_config, P, M)
+            # Persist the global (flattened) latency matrix L into the full cloud
+            # config so the simulation reads latency from here instead of the
+            # immutable placement solution file.
+            requirements_cloud_config["L"] = L.tolist()
             with open(path_cloud, "w") as f:
                 json.dump(requirements_cloud_config, f, indent=4)
             comparison_time.append(t)

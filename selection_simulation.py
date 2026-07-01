@@ -25,15 +25,41 @@ if __name__ == "__main__":
 
 
         parser = argparse.ArgumentParser()
-        parser.add_argument("--num_run", required=True, type=int)
+        parser.add_argument("--num_run", required=False, type=int, default=None)
+        # Optional sensitivity-analysis hook: a folder holding perturbed copies
+        # of (some of) the input files. When set, inputs are read from here
+        # first and fall back to the baseline run folders; results are written
+        # under this folder instead of results/run_<N>/. Unset => unchanged.
+        parser.add_argument("--scenario_dir", required=False, type=str, default=None)
         args = parser.parse_args()
         num_run = args.num_run
+        scenario_dir = args.scenario_dir
+        if num_run is None:
+                while True:
+                        try:
+                                num_run = int(input("Please enter num_run: "))
+                                break
+                        except ValueError:
+                                print("num_run must be an integer. Please try again.")
+
+        # Resolve an input file of a given kind ("cloud"/"workflows"/"placement"):
+        # prefer the scenario copy if it exists, otherwise the baseline run dir.
+        def in_path(kind, name):
+                if scenario_dir:
+                        cand = os.path.join(scenario_dir, kind, name)
+                        if os.path.exists(cand):
+                                return cand
+                return os.path.join(kind, f"run_{num_run}", name)
 
         placement_path=f"placement/run_{num_run}"
         parameter_config_path=f"settings/parameters_{num_run}.json"
         with open(parameter_config_path, "r") as f:
                 parameter_general_config = json.load(f)
         provider_cost_list=parameter_general_config["provider_cost_list"]
+        # Stage 1 stochastic selection: when on, the comparison/centralized
+        # evaluation samples each request's deployment from the continuous policy
+        # H[leaf,:] and reports a Monte-Carlo cost. Absent => off => unchanged.
+        stochastic_selection=parameter_general_config.get("stochastic_selection", False)
         general_config_path=f"cloud/run_{num_run}/general_config.json"
         with open(general_config_path, "r") as f:
                 cloud_general_config = json.load(f)
@@ -87,7 +113,7 @@ if __name__ == "__main__":
                         pred_k = ind_r
                         pred_k_list.append(pred_k)
 
-                        placement_path = f"placement/run_{num_run}/opt_{t}_{pred_k+ind_start_list[r]}.json"
+                        placement_path = in_path("placement", f"opt_{t}_{pred_k+ind_start_list[r]}.json")
                         with open(placement_path, "r") as f:
                                 curr_placement = json.load(f)
                         L=curr_placement["L"]
@@ -143,7 +169,7 @@ if __name__ == "__main__":
         request_rates = np.zeros((num_workflows, num_leaves))
         for t in range(num_workflows):
                 cloud_name = f"requirements_cloud_full.json"
-                path_cloud = os.path.join(f"cloud/run_{num_run}", cloud_name)
+                path_cloud = in_path("cloud", cloud_name)
                 with open(path_cloud, "r") as f:
                         cloud_config = json.load(f)
                 for k in range(num_leaves):
@@ -152,7 +178,7 @@ if __name__ == "__main__":
 
         # RAM capacity per physical node: only edge (tinyfaas) nodes are
         # limited; cloud nodes never block due to RAM.
-        cloud_full_path = os.path.join(f"cloud/run_{num_run}", "requirements_cloud_full.json")
+        cloud_full_path = in_path("cloud", "requirements_cloud_full.json")
         with open(cloud_full_path, 'r') as f:
                 cloud_full = json.load(f)
         num_nodes_global = cloud_full.get('num_nodes', 0)
@@ -172,7 +198,7 @@ if __name__ == "__main__":
         # converting the final choice to a global node index with get_leaf.
         def reconstruct_full_solution(w):
 
-                wf_path = os.path.join(f"workflows/run_{num_run}", f"requirements_workflow_{w}_0.json")
+                wf_path = in_path("workflows", f"requirements_workflow_{w}_0.json")
                 try:
                         with open(wf_path, 'r') as f:
                                 wf_conf = json.load(f)
@@ -191,7 +217,7 @@ if __name__ == "__main__":
                 L_full = []
                 a_full = []
                 b_full = []
-                full_path = os.path.join(f"placement/run_{num_run}", f"opt_{w}_full.json")
+                full_path = in_path("placement", f"opt_{w}_full.json")
                 try:
                         with open(full_path, 'r') as f:
                                 full_place_tmp = json.load(f)
@@ -205,9 +231,13 @@ if __name__ == "__main__":
                                                 b_full[r][-1]=0
                 except Exception:
                         pass
+                # Latency now lives in the cloud config; the opt_<w>_full.json L
+                # read above is only a fallback for runs generated before L was
+                # relocated. Prefer the (perturbable) cloud-config L.
+                L_full = cloud_full.get('L', L_full)
 
 
-                top_path = os.path.join(f"placement/run_{num_run}", f"opt_{w}_0.json")
+                top_path = in_path("placement", f"opt_{w}_0.json")
                 try:
                         with open(top_path, 'r') as f:
                                 top_place = json.load(f)
@@ -246,7 +276,7 @@ if __name__ == "__main__":
                                 for r in range(num_levels):
                                         if r != 0:
                                                 opt_num = find_opt(opt_num, prev_selected_place, r)
-                                        placement_path = f"placement/run_{num_run}/opt_{w}_{opt_num}.json"
+                                        placement_path = in_path("placement", f"opt_{w}_{opt_num}.json")
                                         try:
                                                 with open(placement_path, 'r') as f:
                                                         curr_placement = json.load(f)
@@ -256,7 +286,7 @@ if __name__ == "__main__":
                                         curr_P = curr_placement.get('P', [])
                                         curr_workflow = {}
                                         try:
-                                                workflow_path = f"workflows/run_{num_run}/requirements_workflow_{w}_{opt_num}.json"
+                                                workflow_path = in_path("workflows", f"requirements_workflow_{w}_{opt_num}.json")
                                                 with open(workflow_path, 'r') as f:
                                                         curr_workflow = json.load(f)
                                         except Exception:
@@ -328,9 +358,9 @@ if __name__ == "__main__":
         # rounded execution duration (cloud speedup applied) and RAM demand.
         # This per-workflow table (perwf) drives the event simulation below.
         for w in range(num_workflows):
-                wf_path = os.path.join(f"workflows/run_{num_run}", f"requirements_workflow_{w}_0.json")
-                sol_path = os.path.join(f"placement/run_{num_run}", f"opt_{w}_full.json")
-                node_path = os.path.join(f"cloud/run_{num_run}", f"requirements_cloud_full.json")
+                wf_path = in_path("workflows", f"requirements_workflow_{w}_0.json")
+                sol_path = in_path("placement", f"opt_{w}_full.json")
+                node_path = in_path("cloud", f"requirements_cloud_full.json")
                 try:
                         with open(wf_path, 'r') as f:
                                 wf_conf = json.load(f)
@@ -778,8 +808,8 @@ if __name__ == "__main__":
         select_cost_all=0
         for t in range(num_workflows):
                 select_cost=0
-                workflow_path=f"workflows/run_{num_run}/requirements_workflow_{t}_0.json"
-                placement_path=f"placement/run_{num_run}/opt_{t}_0.json"
+                workflow_path=in_path("workflows", f"requirements_workflow_{t}_0.json")
+                placement_path=in_path("placement", f"opt_{t}_0.json")
                 with open(workflow_path, "r") as f:
                         workflow_config = json.load(f)
                 with open(placement_path, "r") as f:
@@ -836,9 +866,9 @@ if __name__ == "__main__":
                                         for r in range(num_levels):
                                                 if r!=0:
                                                         opt_num=find_opt(opt_num,prev_selected_place,r)
-                                                placement_path=f"placement/run_{num_run}/opt_{t}_{opt_num}.json"
-                                                workflow_path = f"workflows/run_{num_run}/requirements_workflow_{t}_{opt_num}.json"
-                                                cloud_path = f"cloud/run_{num_run}/requirements_cloud_{r}_{opt_num-ind_start_list[r]}.json"
+                                                placement_path=in_path("placement", f"opt_{t}_{opt_num}.json")
+                                                workflow_path = in_path("workflows", f"requirements_workflow_{t}_{opt_num}.json")
+                                                cloud_path = in_path("cloud", f"requirements_cloud_{r}_{opt_num-ind_start_list[r]}.json")
                                                 with open(placement_path, "r") as f:
                                                         curr_placement = json.load(f)
                                                 with open(cloud_path, "r") as f:
@@ -847,7 +877,9 @@ if __name__ == "__main__":
                                                         curr_workflow = json.load(f)
 
                                                 curr_P=curr_placement['P']
-                                                curr_L = curr_placement['L']
+                                                # Region latency from the (perturbable) cloud config;
+                                                # opt-file L kept only as a legacy fallback.
+                                                curr_L = curr_cloud.get('L', curr_placement['L'])
                                                 if r==0:
 
                                                         curr_selected_workflow = selected_workflow
@@ -903,7 +935,7 @@ if __name__ == "__main__":
                                                                         curr_placement = json.load(f)
 
 
-                                                                curr_L = curr_placement['L']
+                                                                curr_L = curr_cloud.get('L', curr_placement['L'])
                                                                 L_func[m] += curr_L[pos_list[r]][selected_place]
                                                         else:
                                                                 L_func[m] += curr_L[0][selected_place]
@@ -944,10 +976,16 @@ if __name__ == "__main__":
 
                                         if pred_k_list[r] == pred_k_list_new[r]:
                                                 opt_num=pred_k_list[r]+ind_start_list[r]
-                                                placement_path = f"placement/run_{num_run}/opt_{t}_{opt_num}.json"
+                                                placement_path = in_path("placement", f"opt_{t}_{opt_num}.json")
                                                 with open(placement_path, "r") as f:
                                                         curr_placement = json.load(f)
-                                                curr_L = curr_placement['L']
+                                                # Region latency from the (perturbable) cloud config
+                                                # (opt_num - ind_start_list[r] == pred_k_list[r]);
+                                                # opt-file L kept only as a legacy fallback.
+                                                cloud_path = in_path("cloud", f"requirements_cloud_{r}_{pred_k_list[r]}.json")
+                                                with open(cloud_path, "r") as f:
+                                                        curr_cloud = json.load(f)
+                                                curr_L = curr_cloud.get('L', curr_placement['L'])
                                                 L_end += curr_L[pos_list[r]][pos_list_new[r]]
                                         else:
                                                 L_end += lat_upward_list_new[r]
@@ -976,9 +1014,11 @@ if __name__ == "__main__":
         overall_cost = w_1 * money_cost_all+ w_2 * sum(req_done_list)
         print(sum(sum(waiting_acc)))
         print([overall_cost])
-        results_path = f"results/run_{num_run}/results.json"
-        if not os.path.exists(os.path.join("results",f"run_{num_run}")):
-                os.mkdir(os.path.join("results",f"run_{num_run}"))
+        # Results go under the scenario folder in sensitivity mode, else the
+        # baseline results/run_<N>/ folder (unchanged default behavior).
+        results_dir = os.path.join(scenario_dir, "results") if scenario_dir else os.path.join("results", f"run_{num_run}")
+        os.makedirs(results_dir, exist_ok=True)
+        results_path = os.path.join(results_dir, "results.json")
         results={}
         results['overall_cost']=overall_cost
         results['money_cost']=money_cost_all
@@ -1003,13 +1043,13 @@ if __name__ == "__main__":
                 request_rates=np.zeros((num_workflows,num_leaves))
                 for t in range(num_workflows):
                         cloud_name = f"requirements_cloud_full.json"
-                        path_cloud = os.path.join(f"cloud/run_{num_run}", cloud_name)
+                        path_cloud = in_path("cloud", cloud_name)
                         with open(path_cloud, "r") as f:
                                 cloud_config = json.load(f)
                         for k in range(num_leaves):
                                 request_rates[t,k]=cloud_config["providers"][f"provider_{k+num_other}"]["request_rate"]
                 requests=np.zeros((sim_time,num_workflows,num_leaves))
-                cloud_full_path = os.path.join(f"cloud/run_{num_run}", "requirements_cloud_full.json")
+                cloud_full_path = in_path("cloud", "requirements_cloud_full.json")
                 with open(cloud_full_path, 'r') as f:
                         cloud_full = json.load(f)
                 num_nodes_global = cloud_full.get('num_nodes', 0)
@@ -1020,7 +1060,7 @@ if __name__ == "__main__":
 
                 def reconstruct_full_solution(w):
 
-                        wf_path = os.path.join(f"workflows/run_{num_run}", f"requirements_workflow_{w}_0.json")
+                        wf_path = in_path("workflows", f"requirements_workflow_{w}_0.json")
                         try:
                                 with open(wf_path, 'r') as f:
                                         wf_conf = json.load(f)
@@ -1036,7 +1076,7 @@ if __name__ == "__main__":
 
 
                         L_full = []
-                        full_path = os.path.join(f"placement/run_{num_run}", f"opt_{w}_full.json")
+                        full_path = in_path("placement", f"opt_{w}_full.json")
                         try:
                                 with open(full_path, 'r') as f:
                                         full_place_tmp = json.load(f)
@@ -1044,9 +1084,12 @@ if __name__ == "__main__":
                                                 L_full = full_place_tmp.get('L', [])
                         except Exception:
                                 pass
+                        # Prefer the (perturbable) cloud-config L; the opt-file
+                        # read above is only a backward-compatibility fallback.
+                        L_full = cloud_full.get('L', L_full)
 
 
-                        top_path = os.path.join(f"placement/run_{num_run}", f"opt_{w}_0.json")
+                        top_path = in_path("placement", f"opt_{w}_0.json")
                         try:
                                 with open(top_path, 'r') as f:
                                         top_place = json.load(f)
@@ -1080,7 +1123,7 @@ if __name__ == "__main__":
                                         for r in range(num_levels):
                                                 if r != 0:
                                                         opt_num = find_opt(opt_num, prev_selected_place, r)
-                                                placement_path = f"placement/run_{num_run}/opt_{w}_{opt_num}.json"
+                                                placement_path = in_path("placement", f"opt_{w}_{opt_num}.json")
                                                 try:
                                                         with open(placement_path, 'r') as f:
                                                                 curr_placement = json.load(f)
@@ -1090,7 +1133,7 @@ if __name__ == "__main__":
                                                 curr_P = curr_placement.get('P', [])
                                                 curr_workflow = {}
                                                 try:
-                                                        workflow_path = f"workflows/run_{num_run}/requirements_workflow_{w}_{opt_num}.json"
+                                                        workflow_path = in_path("workflows", f"requirements_workflow_{w}_{opt_num}.json")
                                                         with open(workflow_path, 'r') as f:
                                                                 curr_workflow = json.load(f)
                                                 except Exception:
@@ -1146,9 +1189,9 @@ if __name__ == "__main__":
 
                         return {'P': P_full, 'H': H_full, 'L': L_full}
                 for w in range(num_workflows):
-                        wf_path = os.path.join(f"workflows/run_{num_run}", f"requirements_workflow_{w}_0.json")
-                        sol_path = os.path.join(f"placement/run_{num_run}", f"opt_{w}_full.json")
-                        node_path = os.path.join(f"cloud/run_{num_run}", f"requirements_cloud_full.json")
+                        wf_path = in_path("workflows", f"requirements_workflow_{w}_0.json")
+                        sol_path = in_path("placement", f"opt_{w}_full.json")
+                        node_path = in_path("cloud", f"requirements_cloud_full.json")
                         try:
                                 with open(wf_path, 'r') as f:
                                         wf_conf = json.load(f)
@@ -1181,8 +1224,18 @@ if __name__ == "__main__":
                                                 sol_conf = sol_conf or {}
                         P = sol_conf.get('P', [])
                         H = sol_conf.get('H', [])
-                        L = sol_conf.get('L', [])
-                        Speed = sol_conf.get('Speed', None)
+                        # Latency from the (perturbable) full cloud config; fall
+                        # back to the placement solution L for legacy runs.
+                        L = cloud_full.get('L', sol_conf.get('L', []))
+                        # Derive the execution speedup from the (perturbable) workflow
+                        # 'speedup' field, like the decomposed path, instead of the
+                        # opt_<t>_full.json 'Speed' matrix. That matrix freezes the
+                        # baseline speedup (it is built from the workflow field: the
+                        # workflow speedup on cloud nodes, 1 on tinyfaas), so reading
+                        # it would make the comparison blind to speedup perturbation.
+                        # Using None here is baseline-preserving and makes the
+                        # comparison respond to a perturbed 'speedup'.
+                        Speed = None
                         a = sol_conf.get('a', [])
                         b = sol_conf.get('b', [])
                         # Count the shared start/finish functions in only one branch so
@@ -1193,21 +1246,20 @@ if __name__ == "__main__":
                                         b[r][-1] = 0
                         num_funcs = wf_conf.get('num_functions', 0)
                         perwf[w] = {}
-                        for leaf in range(num_leaves):
-                                sel_work = 0
-                                try:
-                                        sel_work = int(np.where(np.array(H[leaf]) == 1)[0][0]) if H else 0
-                                except Exception:
-                                        sel_work = 0
+                        num_deployment = wf_conf.get('deployment_number', 1)
+                        num_paths_w = wf_conf.get('paths', {}).get('num_paths', 0)
 
+                        # Build the execution plan (nodes/durations/rams) of a given
+                        # deployment d for this workflow. Shared by the deterministic
+                        # and stochastic paths so both compute durations identically.
+                        def build_plan(d):
                                 selected_places = []
                                 for m in range(num_funcs):
                                         try:
-                                                row = P[sel_work * num_funcs + m]
+                                                row = P[d * num_funcs + m]
                                                 selected_places.append(int(np.where(np.array(row) == 1)[0][0]))
                                         except Exception:
                                                 selected_places.append(0)
-
                                 durations = [0] * num_funcs
                                 rams = [0] * num_funcs
                                 for m in range(num_funcs):
@@ -1226,28 +1278,72 @@ if __name__ == "__main__":
                                                                 speedup = func_conf.get('speedup', 1)
                                                         else:
                                                                 speedup = 1
-
                                                 dur = int(np.ceil(speedup * base_time))
                                                 durations[m] = dur
                                                 rams[m] = func_conf.get('ram', 0)
                                         except Exception:
                                                 durations[m] = 0
                                                 rams[m] = 0
+                                return selected_places, durations, rams
 
-                                perwf[w][leaf] = {
-                                        'selected_places': selected_places,
-                                        'deployment': int(sel_work),
-                                        'durations': durations,
-                                        'rams': rams,
-                                        'L': L
-                                }
+                        # Ideal (blocking-free) branch time of a plan from leaf `lf`.
+                        def plan_base_T(sel_places, durs, lf):
+                                base_T_paths = []
+                                for s in range(num_paths_w):
+                                        func_nums = np.where(np.array(b[s]) == 1)[0].tolist() if isinstance(b, (list, np.ndarray)) and len(b) > s else []
+                                        tot = 0
+                                        for idx_m in func_nums:
+                                                tot += durs[idx_m]
+                                                pos = func_nums.index(idx_m)
+                                                next_place = sel_places[func_nums[pos + 1]] if pos < len(func_nums) - 1 else lf + num_other
+                                                try:
+                                                        tot += int(np.ceil(L[sel_places[idx_m]][next_place]))
+                                                except Exception:
+                                                        pass
+                                        base_T_paths.append(tot)
+                                return max(base_T_paths) if base_T_paths else 0
+
+                        for leaf in range(num_leaves):
+                                if stochastic_selection:
+                                        # Stochastic policy: keep the full distribution H[leaf,:]
+                                        # and a plan (incl. base_T) for every deployment with
+                                        # positive probability. A request samples one per arrival.
+                                        try:
+                                                dist = [max(0.0, float(x)) for x in H[leaf]]
+                                        except Exception:
+                                                dist = [1.0] + [0.0] * (num_deployment - 1)
+                                        tot_p = sum(dist)
+                                        dist = [x / tot_p for x in dist] if tot_p > 0 else [1.0 / num_deployment] * num_deployment
+                                        plans = {}
+                                        for d in range(num_deployment):
+                                                if dist[d] <= 0:
+                                                        continue
+                                                sp, du, rm = build_plan(d)
+                                                plans[d] = {
+                                                        'selected_places': sp,
+                                                        'durations': du,
+                                                        'rams': rm,
+                                                        'base_T': plan_base_T(sp, du, leaf),
+                                                }
+                                        perwf[w][leaf] = {'dist': dist, 'plans': plans, 'L': L}
+                                else:
+                                        sel_work = 0
+                                        try:
+                                                sel_work = int(np.where(np.array(H[leaf]) == 1)[0][0]) if H else 0
+                                        except Exception:
+                                                sel_work = 0
+                                        selected_places, durations, rams = build_plan(sel_work)
+                                        perwf[w][leaf] = {
+                                                'selected_places': selected_places,
+                                                'deployment': int(sel_work),
+                                                'durations': durations,
+                                                'rams': rams,
+                                                'L': L
+                                        }
 
                         perwf[w]['a'] = a
                         perwf[w]['b'] = b
-                        try:
-                                perwf[w]['num_paths'] = wf_conf.get('paths', {}).get('num_paths', 0)
-                        except Exception:
-                                perwf[w]['num_paths'] = 0
+                        perwf[w]['num_paths'] = num_paths_w
 
                 curr_utilization=np.zeros((num_nodes_global,1))
                 func_blocked=np.zeros((num_workflows,num_functions))
@@ -1265,6 +1361,12 @@ if __name__ == "__main__":
                 req_id_counter = 0
                 req_done_list=[]
                 rng = np.random.default_rng(42)
+                # Separate RNG stream for deployment sampling so the Poisson
+                # request stream (rng) stays identical to the deterministic run.
+                rng_sel = np.random.default_rng(123)
+                # sel_counts[w][leaf][d] = number of requests that sampled
+                # deployment d; drives the Monte-Carlo monetary cost below.
+                sel_counts = [[{} for _ in range(num_leaves)] for _ in range(num_workflows)]
                 for cur_t in range(sim_time):
 
                         requests[cur_t]=rng.poisson(request_rates)
@@ -1441,35 +1543,49 @@ if __name__ == "__main__":
                                                 info = perwf.get(w, {}).get(leaf, None)
                                                 if info is None:
                                                         continue
-                                                sel_places = info['selected_places']
-                                                durs = info['durations']
-                                                rams = info['rams']
                                                 Lmat = info['L']
-
-                                                base_T_paths = []
                                                 a_mat = perwf[w].get('a', [])
                                                 num_paths_local = perwf[w].get('num_paths', 0)
-                                                for s in range(num_paths_local):
-                                                        b_mat = perwf[w].get('b', [])
-                                                        func_nums = np.where(np.array(b_mat[s])==1)[0].tolist() if isinstance(b_mat, (list, np.ndarray)) and len(b_mat) > s else []
-                                                        tot = 0
-                                                        for idx_m in func_nums:
-                                                                tot += durs[idx_m]
+                                                if not stochastic_selection:
+                                                        # Deterministic: one fixed plan and base_T per (w, leaf).
+                                                        sel_places = info['selected_places']
+                                                        durs = info['durations']
+                                                        rams = info['rams']
+                                                        base_T_paths = []
+                                                        for s in range(num_paths_local):
+                                                                b_mat = perwf[w].get('b', [])
+                                                                func_nums = np.where(np.array(b_mat[s])==1)[0].tolist() if isinstance(b_mat, (list, np.ndarray)) and len(b_mat) > s else []
+                                                                tot = 0
+                                                                for idx_m in func_nums:
+                                                                        tot += durs[idx_m]
 
-                                                                if idx_m < len(func_nums) - 1:
-                                                                        next_m = func_nums[func_nums.index(idx_m)+1]
-                                                                        next_place = sel_places[next_m]
-                                                                else:
-                                                                        next_place = leaf + num_other
-                                                                try:
-                                                                        tot += int(np.ceil(Lmat[sel_places[idx_m]][next_place]))
-                                                                except Exception:
-                                                                        pass
-                                                        base_T_paths.append(tot)
-                                                base_T = max(base_T_paths) if base_T_paths else 0
-
-                                                deployment_id = int(info.get('deployment', w))
+                                                                        if idx_m < len(func_nums) - 1:
+                                                                                next_m = func_nums[func_nums.index(idx_m)+1]
+                                                                                next_place = sel_places[next_m]
+                                                                        else:
+                                                                                next_place = leaf + num_other
+                                                                        try:
+                                                                                tot += int(np.ceil(Lmat[sel_places[idx_m]][next_place]))
+                                                                        except Exception:
+                                                                                pass
+                                                                base_T_paths.append(tot)
+                                                        base_T = max(base_T_paths) if base_T_paths else 0
+                                                        deployment_id = int(info.get('deployment', w))
                                                 for i in range(n):
+                                                        if stochastic_selection:
+                                                                # Sample this request's deployment from the policy
+                                                                # H[leaf,:] and use that deployment's plan/base_T.
+                                                                dist = info['dist']
+                                                                d_sel = int(rng_sel.choice(len(dist), p=dist))
+                                                                plan = info['plans'].get(d_sel)
+                                                                if plan is None:
+                                                                        continue
+                                                                sel_places = plan['selected_places']
+                                                                durs = plan['durations']
+                                                                rams = plan['rams']
+                                                                base_T = plan['base_T']
+                                                                deployment_id = d_sel
+                                                                sel_counts[w][leaf][d_sel] = sel_counts[w][leaf].get(d_sel, 0) + 1
                                                         arrival = cur_t
                                                         path_finish_times = []
                                                         b_mat = perwf[w].get('b', [])
@@ -1560,9 +1676,9 @@ if __name__ == "__main__":
 
                         cloud_name = f"requirements_cloud_full.json"
                         sol_name = f"opt_{t}"
-                        path_cloud = os.path.join(f"cloud/run_{num_run}", cloud_name)
-                        path_workflow = os.path.join(f"workflows/run_{num_run}", f"requirements_workflow_{t}" + "_0.json")
-                        path_solution = os.path.join(f"placement/run_{num_run}", sol_name + "_full.json")
+                        path_cloud = in_path("cloud", cloud_name)
+                        path_workflow = in_path("workflows", f"requirements_workflow_{t}" + "_0.json")
+                        path_solution = in_path("placement", sol_name + "_full.json")
 
                         with open(path_cloud, "r") as f:
                                 cloud_config = json.load(f)
@@ -1579,7 +1695,9 @@ if __name__ == "__main__":
                         C = placement_config['C']
                         D = placement_config['D']
                         D_in = placement_config['D_in']
-                        L = placement_config['L']
+                        # Latency from the (perturbable) full cloud config; fall
+                        # back to the placement solution L for legacy runs.
+                        L = cloud_config.get('L', placement_config['L'])
                         S = placement_config['S']
                         num_paths = workflow_config['paths']['num_paths']
                         b = placement_config['b']
@@ -1587,10 +1705,17 @@ if __name__ == "__main__":
                         select_cost=0
                         invocations=np.zeros((num_nodes))
 
-                        for k in range(num_leaves):
+                        # Monetary cost per (leaf, deployment): deterministic weights
+                        # the one-hot deployment by all requests at the leaf; stochastic
+                        # weights each deployment by how many requests sampled it
+                        # (Monte-Carlo expectation over the routing policy H).
+                        if stochastic_selection:
+                                work_items = [(k, d, c) for k in range(num_leaves) for d, c in sel_counts[t][k].items()]
+                        else:
+                                work_items = [(k, H[k].index(1), overall_requests[t, k]) for k in range(num_leaves)]
+                        for k, selected_workflow, weight in work_items:
 
                                 pred_k=k+num_other
-                                selected_workflow = H[k].index(1)
                                 time_cost = 0
                                 money_cost = 0
 
@@ -1667,8 +1792,8 @@ if __name__ == "__main__":
                                 money_cost += np.sum(C_func) + np.sum(D_func) + D_in_0
 
 
-                                time_cost_all += overall_requests[t,k]*time_cost
-                                money_cost_all += overall_requests[t,k]*money_cost
+                                time_cost_all += weight*time_cost
+                                money_cost_all += weight*money_cost
 
         overall_cost = w_1 * money_cost_all+w_2 * sum(req_done_list)
         print(overall_cost)
@@ -1686,6 +1811,6 @@ if __name__ == "__main__":
                 'request_logs': request_logs,
                 'waiting_acc': waiting_acc.tolist()
         }
-        detailed_path = os.path.join(f"results/run_{num_run}", f"detailed_simulation_run_{num_run}.json")
+        detailed_path = os.path.join(results_dir, f"detailed_simulation_run_{num_run}.json")
         with open(detailed_path, 'w') as f:
                 json.dump(detailed, f, indent=2)

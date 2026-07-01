@@ -14,7 +14,7 @@ from typing import Any, Dict
 import time
 
 # %%
-def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, Any], gap=0,w_1=1,w_2=1,w_3=1,provider_name_list=[],provider_cost_list=[],heuristic=False):
+def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, Any], gap=0,w_1=1,w_2=1,w_3=1,provider_name_list=[],provider_cost_list=[],heuristic=False,relax_selection=False):
     """Solve the placement + selection problem (Eq. (1) of the paper) with Gurobi.
 
     Parameters
@@ -230,7 +230,16 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         #   p[m+n*F]    : function utilization u_{n,m} (penalized quadratically)
         P=model.addVars( num_functions* num_workflows, num_nodes,vtype=GRB.BINARY, name="P")
         S = model.addVars(num_functions * num_workflows, num_nodes, vtype=GRB.CONTINUOUS, name="S")
-        H=model.addVars(num_leaves,num_workflows,vtype=GRB.BINARY, name="H")
+        # Selection H_{k,n}: binary one-hot by default; when relax_selection is
+        # set, H becomes a continuous stochastic policy in [0,1] (probability that
+        # leaf k routes a request to deployment n). The objective is already an
+        # expectation over H, so only the variable type changes; the w_3
+        # utilization penalty is what keeps the relaxed policy non-degenerate.
+        if relax_selection:
+            H=model.addVars(num_leaves,num_workflows,lb=0,ub=1,vtype=GRB.CONTINUOUS, name="H")
+            model.setParam('NonConvex', 2)
+        else:
+            H=model.addVars(num_leaves,num_workflows,vtype=GRB.BINARY, name="H")
         T=model.addVars(num_workflows,lb=0, ub=float('inf'),vtype=GRB.CONTINUOUS, name="T")
         M = model.addVars(num_nodes, vtype=GRB.CONTINUOUS, name="M")
         p = model.addVars(num_functions*num_workflows,vtype=GRB.CONTINUOUS,name="p")
@@ -392,7 +401,9 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
                     if s == num_functions*num_workflows:
                         s=0
                 elif index<2*num_functions*num_workflows*num_nodes+num_leaves*num_workflows:
-                    H[s, r] = round(v.x)
+                    # Keep the continuous probability when relaxed; otherwise the
+                    # binary selection is recovered by rounding the solver value.
+                    H[s, r] = v.x if relax_selection else round(v.x)
                     r = r + 1
                     if r == num_workflows:
                         s = s + 1

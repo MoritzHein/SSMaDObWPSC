@@ -1,7 +1,7 @@
 {
     "num_levels": 2,
     "num_workflows": 10,
-    "seed": 42,
+    "seed": 43,
     "w_1": 0.0001,
     "w_2": 1.0001,
     "w_3": 0.0001,
@@ -36,8 +36,8 @@
     },
     "num_tiny_first": 2,
     "comparison": true,
-    "heuristic": false,
-    "comparison_gap": 1.0,
+    "heuristic": true,
+    "comparison_gap": 0.0,
     "own_gap": 0.0,
     "config_random_workflows": {
         "deploy_min": 2,
@@ -66,8 +66,8 @@
         "ram_max": 1000,
         "user_request_rate_min": 0.03,
         "user_request_rate_max": 0.05,
-        "nodes_min": 3,
-        "nodes_max": 4,
+        "nodes_min": 10,
+        "nodes_max": 11,
         "base_decrease": 10
     }
 }
