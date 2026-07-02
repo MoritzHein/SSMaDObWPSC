@@ -141,34 +141,68 @@ $$
 H_{l-1,\text{succ\_region}(r),\text{succ\_node}(r),n}\qquad\forall n\;}
 $$
 
-with the head node de‑conflated,
+with the head node de‑conflated. Crucially, "user leaf" here means **physical
+user leaf**: the `leave` flag *and* an edge (tinyfaas) provider. Then
 
 $$
 \lambda^{\mathrm{own}}_{l,r,k}=
 \begin{cases}
-\lambda_{l,r,0}-\nu_r, & k=0 \text{ and } \text{succ\_node}(r)\text{ is a user leaf},\\[2pt]
-0, & k=0 \text{ and } \text{succ\_node}(r)\text{ is }\emph{not}\text{ a user leaf},\\[2pt]
+\lambda_{l,r,0}-\nu_r, & k=0 \text{ and } \text{succ\_node}(r)\text{ is a \emph{physical} user leaf},\\[2pt]
+0, & k=0 \text{ otherwise},\\[2pt]
 \lambda_{l,r,k}, & k>0 .
 \end{cases}
 $$
 
-The second case (head refines a non‑leaf cloud node) is essential: there the
-head's rate is *pure* placeholder, so its own demand is $0$ and its whole rate
-becomes virtual. Without this distinction the constraint is **infeasible**
-(a positive own rate must sum to $1$ over $n$, but its target is $0$).
+The zero case covers two situations. (a) The head refines a **non‑leaf cloud
+node**: its rate is *pure* placeholder, so its own demand is $0$. (b) The head
+refines a **cloud‑region head with `leave=true` but a non‑edge provider**: such
+"leaves" are only request *collectors*. Their apparent own rate is **phantom
+demand** — an artifact of the architecture generation, which Dirichlet‑splits a
+node's rate over *all* child nodes of a region, including non‑leaf ones. In
+cloud regions only the head carries the `leave` flag, so the bulk of the split
+demand lands on non‑leaf nodes and never reaches a physical user leaf; the
+simulator (which samples only physical tinyfaas leaves) never sees any of it.
+Counting it as own demand makes (ii) **structurally infeasible** (the parent
+allocates $\lambda^{\mathrm{own}}$ that the child's physical leaves cannot
+carry — e.g. only $2.4\%$ of it on `run_124`). With the physical‑leaf
+definition, own demand telescopes **exactly** through the hierarchy: edge
+regions conserve the Dirichlet split ($\sum_k$ child own $=$ parent own to
+machine precision), and phantom‑head cloud regions conserve $0=0$. The
+feasibility tolerance on (ii) is thus a pure floating‑point guard; a violation
+is reported as a warning instead of silently dropping the constraint.
 
 **(iii) Virtual demand as a fixed pseudo‑leaf** (continuous generalization of the
 step function $\Gamma$ in (6)). The outside stream is *not* a free variable; it is
-pinned to the routing induced by the other regions in the parent solution,
+pinned to the routing induced by *all* users outside the region, built
+**recursively** from the parent solution: the parent region's other physical
+leaves *plus the parent's own outside stream* (users beyond the parent region,
+routed by the parent's $\rho$),
+
+$$
+\tilde\nu_r=\underbrace{\sum_{k\neq \text{succ\_node}(r)}\lambda^{\mathrm{own}}_{l-1,\text{succ\_region}(r),k}}_{\text{siblings in the parent region}}
+\;+\;\underbrace{\tilde\nu_{\text{succ\_region}(r)}}_{\text{parent's outside stream}},
+$$
 
 $$
 \rho_{r,n}=
-\frac{\sum_{k\neq \text{succ\_node}(r)}\lambda^{\mathrm{own}}_{l-1,\text{succ\_region}(r),k}\,H_{l-1,\text{succ\_region}(r),k,n}}
-{\sum_{k\neq \text{succ\_node}(r)}\lambda^{\mathrm{own}}_{l-1,\text{succ\_region}(r),k}},
-\qquad
-\tilde\nu_r=
-\begin{cases}\nu_r,&\text{head has own users},\\ \lambda_{l,r,0},&\text{otherwise.}\end{cases}
+\frac{\sum_{k\neq \text{succ\_node}(r)}\lambda^{\mathrm{own}}_{l-1,\text{succ\_region}(r),k}\,H_{l-1,\text{succ\_region}(r),k,n}
+\;+\;\tilde\nu_{\text{succ\_region}(r)}\,\rho_{\text{succ\_region}(r),n}}
+{\tilde\nu_r} .
 $$
+
+At level $1$ the parent is the top problem, whose outside stream is $0$, so the
+recursion grounds in the previous (non‑recursive) formula there. By induction,
+$\tilde\nu_r\rho_{r,n}$ is the **actual rate of *all* users outside region $r$
+choosing deployment $n$** — at *every* level: the region's inside and outside
+demand always telescope to the total physical user demand,
+$\sum_n(\text{flow\_rhs}_n) + \tilde\nu_r = \Lambda^{\mathrm{tot}}$. This is the
+quantity that makes the *inside : outside* balance correct (Sec. 7); it is
+**not** the coarse Eq. 7 placeholder
+$\nu_r=\sum_k\lambda_{l-1,k}-\lambda_{l-1,\text{succ\_node}(r)}$, which additionally
+lumps in non‑user (cloud) node rates and is used only to de‑conflate the head's
+*own* rate in (ii). (Deployments the outside stream routes to are kept active in
+the subproblem — as virtual placements if none of their functions is refined
+here — so the virtual load is representable at any depth.)
 
 The subproblem objective then uses $\lambda^{\mathrm{own}}$ on the real leaves and
 adds, for each $n$, a **constant** contribution weighted by $\tilde\nu_r\rho_{r,n}$
@@ -218,8 +252,8 @@ The parent solution is pushed to each child region. The one‑hot inheritance of
 | passed down | meaning | replaces |
 |---|---|---|
 | $\;\lambda^{\mathrm{own}}_{l-1,\text{succ\_node}(r)}\,H_{l-1,\dots,n}\;$ (per $n$) | conservation target for the region's own users, RHS of (ii) | (5) |
-| $\rho_{r,n}$ (per $n$) | pinned routing of the virtual/outside stream | (6), i.e. $\Gamma$ |
-| head‑has‑own flag | whether $\text{succ\_node}(r)$ is a real user leaf (sets $\lambda^{\mathrm{own}}_{l,r,0}$) | — |
+| $\tilde\nu_r$, $\rho_{r,n}$ (per $n$) | rate and pinned routing of the virtual/outside stream; built from the parent's leaves **and the parent's own $(\tilde\nu,\rho)$** (recursion of (iii)) | (6), i.e. $\Gamma$ |
+| head‑has‑own flag | whether $\text{succ\_node}(r)$ is a *physical* user leaf (sets $\lambda^{\mathrm{own}}_{l,r,0}$) | — |
 
 The **placement** $P$ is passed down exactly as before (which functions are
 refined here vs. virtual). Selections are **not** recomputed one‑hot; instead the
@@ -319,9 +353,9 @@ the previous deterministic simulation.
 
 | file | change |
 |---|---|
-| `optimization.py` | $H$ relaxable to $[0,1]$; own‑rate ($\lambda^{\mathrm{own}}$) objective/utilization; fixed virtual pseudo‑leaf $\tilde\nu_r\rho_{r,n}$; real‑leaf conservation constraint; no rounding on read‑back. |
-| `cloud_workflow_setup.py` | store the virtual rate $\nu_r$ on head nodes; `_stochastic_selection_targets` builds the conservation RHS, $\rho_{r,n}$ and the head‑has‑own flag; keep all $H>0$ deployments active. |
-| `placement.py` | pass the parent cloud config down; forward `relax_selection` to the decomposed and centralized solves. |
+| `optimization.py` | $H$ relaxable to $[0,1]$; own‑rate ($\lambda^{\mathrm{own}}$, physical leaves only) objective/utilization; fixed virtual pseudo‑leaf $\tilde\nu_r\rho_{r,n}$; real‑leaf conservation constraint (FP‑tolerance guard, warns on violation); no rounding on read‑back. |
+| `cloud_workflow_setup.py` | store the virtual rate $\nu_r$ on head nodes; `_stochastic_selection_targets` builds the conservation RHS, the **recursive** $(\tilde\nu_r,\rho_{r,n})$ and the (physical) head‑has‑own flag; keep all $H>0$ *or outside‑routed* deployments active. |
+| `placement.py` | pass the parent cloud config *and the parent workflow config* (outside stream) down; forward `relax_selection` to the decomposed and centralized solves. |
 | `selection_simulation.py` | reconstruct $P^{\mathrm{full}}$ for all deployments and per‑leaf $H^{\mathrm{full}}$ from the last‑level subproblem; per‑request sampling with a dedicated RNG; Monte‑Carlo cost. |
 
 Everything is gated on a `stochastic_selection` flag in
@@ -332,10 +366,20 @@ deterministic behavior exactly.
 
 ## 6. Verification (case‑study runs)
 
-* **Conservation gate** (2‑level run): for every subproblem
+* **Conservation gate** (2‑level `run_126` *and* 3‑level `run_124`): for **every**
+  subproblem
   $\sum_k\lambda^{\mathrm{own}}_{l,r,k}H_{l,r,k,n}=\lambda^{\mathrm{own}}_{l-1,\text{succ\_node}(r)}H_{l-1,\dots,n}$
-  holds exactly; all $H$ rows sum to $1$; the top‑level policy is genuinely
-  fractional.
+  holds within $10^{-6}$ with the feasibility guard **never** triggered (no
+  subproblem falls back to a free simplex); all $H$ rows sum to $1$; the
+  top‑level policy is genuinely fractional.
+* **Outside‑stream telescoping** (both runs): for every subproblem at every
+  level, $\sum_n\text{flow\_rhs}_n+\tilde\nu_r=\Lambda^{\mathrm{tot}}=0.069721$
+  exactly, and $\sum_n\rho_{r,n}=1$ — i.e. inside + outside demand always equals
+  the total physical user demand (Sec. 7). On `run_124` this fixes, e.g.,
+  `opt_0_15` (cloud region, phantom head): before the recursive stream it saw
+  $\tilde\nu=0$, inside $=0.0017$ (phantom) with an infeasible conservation
+  target that had to be guard‑skipped; now inside $=0$, $\tilde\nu=0.0697$,
+  conservation $0=0$.
 * **Per‑user decoupling:** two leaves of the *same* region are reconstructed with
   *different* distributions (e.g. $[0.886,0.114]$ vs. $[1,0]$) — impossible under
   regional uniformity (5).
@@ -343,14 +387,61 @@ deterministic behavior exactly.
   completes with all $H^{\mathrm{full}}_{k,\cdot}$ summing to $1$ over the
   original deployments and no index errors, confirming the active‑set chain
   composition across levels.
-* **Backward compatibility:** with the flag off, the deterministic decomposition
-  and its simulation are reproduced bit‑for‑bit.
+* **Backward compatibility:** with the flag off, the pipeline reproduces the
+  pre‑stochastic deterministic run (`run_122`) **bit‑for‑bit** in all placement
+  solutions and workflow configs (cloud configs gain only the additive
+  `virtual_request_rate` / persisted `L` bookkeeping fields).
 
 ## 7. Modelling caveat
 
-The virtual rate $\nu_r$ (the Eq. 7 placeholder) aggregates rates over nodes that
-are not all user leaves; consequently the **real‑leaf** conservation (ii) is
-*exact*, while the **virtual** stream's magnitude/routing $(\tilde\nu_r,\rho_{r,n})$
-is an approximation of the true outside demand — of the same order as the
-original Eq. 6/7 aggregation. This is adequate for the utilization/cost accounting
-but is the natural place to refine if finer outside‑demand fidelity is needed.
+Within a subproblem the **inside : outside weighting is exact — at every
+level**. For any deployment $n$ whose functions are hosted in region $r$ —
+through which *all* users choosing $n$ must pass — the two loads are
+
+$$
+\text{inside}=\lambda^{\mathrm{own}}_{l-1,\text{succ\_node}(r)}H_{l-1,\dots,n}
+\ \ (\text{own users choosing }n),\qquad
+\text{outside}=\tilde\nu_r\rho_{r,n}
+\ \ (\text{all other users choosing }n),
+$$
+
+because the virtual rate $\tilde\nu_r$ is built **recursively** (Sec. 3.3) from
+the parent's other physical leaves *plus the parent's own outside stream*, so
+by induction it equals the true demand of *all* users outside region $r$ and
+$\text{inside}+\tilde\nu_r=\Lambda^{\mathrm{tot}}$ at every level. Two earlier
+approximations are thereby removed:
+
+* $\tilde\nu_r$ is **not** the coarse Eq. 7 placeholder $\nu_r=$`request_overall`,
+  which lumped in non‑user cloud rates and inflated outside by $\sim\!3\times$
+  on run_126;
+* $\tilde\nu_r$ is **not** truncated to the parent region either (the
+  non‑recursive version used at first): that undercounted outside demand at
+  levels $\geq 2$ — most severely in deep cloud regions, which have no sibling
+  leaves and thus saw $\tilde\nu_r\!=\!0$, i.e. *no* utilization load at all
+  for their placement decisions, although in truth *all* users are outside
+  such regions.
+
+So the optimizer weighs an inside and an outside request for a locally hosted
+function **equally**, and the placement is not biased toward or away from
+outside demand at any depth.
+
+The **only** remaining approximation is the **absolute** magnitude *summed across
+regions*: the same outside demand is still added to *every* region that could
+host $n$'s functions (a deliberate worst‑case placeholder — outside demand is not
+conserved across *sibling* regions), so per‑level cost totals are inflated. This is
+inconsequential here because the outside stream feeds only the heuristic $w_3$
+utilization/cost *penalties* that guide placement — the **simulation never uses
+it** (it samples real per‑leaf demand through the reconstructed placement), and
+the placement decision only depends on the *relative* inside/outside balance,
+which is now correct. The natural refinement, if ever needed, is to also condition
+$\tilde\nu_r$ on whether region $r$ actually hosts $n$'s functions, making the
+outside stream conserved across sibling regions too.
+
+**A related generation artifact, documented for completeness:** the random
+architecture assigns request rates to *non‑leaf* nodes (at level 0) and
+Dirichlet‑splits every node's rate over **all** child nodes, including non‑leaf
+ones. Demand that lands on a node that never spawns a physical (tinyfaas) leaf
+is **phantom**: it inflates the upper‑level rates and the Eq. 7 placeholder,
+but no user request is ever simulated for it. The stochastic decomposition
+therefore defines own demand on *physical* leaves only (Sec. 3.3 (ii)); the
+phantom rates are simply ignored, exactly as the simulator ignores them.

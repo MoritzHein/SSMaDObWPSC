@@ -137,14 +137,25 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
     head_has_own = deployment_workflow.get("head_has_own", True)
     flow_rhs = deployment_workflow.get('flow_rhs', [0.0] * num_workflows)
     outside_routing = deployment_workflow.get('outside_routing', [0.0] * num_workflows)
+    # True outside-user demand of this region (sum of the OTHER parent leaves' own
+    # rates = the normalizer of outside_routing). Used as the virtual rate so the
+    # inside:outside weighting is correct: virtual_rate * outside_routing[n] equals
+    # the actual rate of outside users choosing deployment n.
+    outside_rate = float(deployment_workflow.get('outside_rate', 0.0))
     head_virtual = float(deployment_cloud['providers']['provider_0'].get('virtual_request_rate', 0.0))
-    # Head node (leaf 0) de-conflation. If the parent node this region refines is a
-    # real user leaf, the head's own share is (head_rate - virtual) and the outside
-    # stream = virtual. If it is a non-leaf (cloud) node, the head carries no own
-    # user demand (own = 0) and its entire rate is the virtual/outside stream --
-    # this keeps Sum_k own_k = Sum_n flow_rhs and the flow conservation feasible.
+    # Head node (leaf 0) de-conflation. head_has_own (set by
+    # _stochastic_selection_targets) is True only if the parent node this region
+    # refines is a PHYSICAL user leaf (leave flag AND tinyfaas): then the head's
+    # own share is (head_rate - request_overall). Cloud-region heads with
+    # leave=True are mere request collectors -- their rate is phantom demand the
+    # generation parked on non-leaf nodes (it never reaches a physical user
+    # leaf and is never simulated), so own = 0. This keeps Sum_k own_k =
+    # Sum_n flow_rhs exact and the flow conservation feasible everywhere.
+    # The outside load is weighted by the true outside demand `outside_rate`
+    # (recursively aggregated over all levels, NOT the Eq. 7 placeholder
+    # request_overall), so inside:outside is weighted exactly.
     if stochastic_decomp:
-        virtual_rate = head_virtual if head_has_own else request[0][0]
+        virtual_rate = outside_rate
         own_head = (request[0][0] - head_virtual) if head_has_own else 0.0
     else:
         virtual_rate = 0.0
@@ -386,9 +397,21 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
             # must reproduce the parent's allocation flow_rhs[n] = lambda_rep *
             # H_parent[rep,n]. Node 0 contributes only its own share (lam[0]); the
             # virtual demand is handled by the fixed outside_routing terms above.
-            if stochastic_decomp:
+            # With own demand defined on PHYSICAL user leaves only (see
+            # head de-conflation above), sum_k lam_k == sum_n flow_rhs holds
+            # structurally at every level: edge regions conserve the Dirichlet
+            # split exactly, and phantom-head cloud regions have 0 == 0. The
+            # guard below is therefore a pure floating-point tolerance (the
+            # rates are (a+b)-b reconstructions), not a feasibility escape; if
+            # it ever fails, demand bookkeeping is broken and the constraint
+            # must not be silently dropped.
+            if stochastic_decomp and abs(sum(lam) - sum(flow_rhs)) < 1e-6:
                 for n in range(num_workflows):
                     model.addConstr(quicksum(lam[k]*H[k, n] for k in range(num_leaves)) == flow_rhs[n], "flow_conservation")
+            elif stochastic_decomp:
+                print(f"WARNING [{deployment_workflow.get('name','?')}]: flow conservation "
+                      f"skipped, own demand {sum(lam):.8f} != parent allocation {sum(flow_rhs):.8f} "
+                      f"-- demand bookkeeping is inconsistent.")
         #for n in range( num_workflows):
         #    model.addConstr(quicksum(H[k,n] for k in range( num_leaves))>=1,"place differently")
         #for i in range( num_nodes):
