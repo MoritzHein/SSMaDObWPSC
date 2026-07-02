@@ -244,6 +244,105 @@ if __name__ == "__main__":
                 except Exception:
                         top_place = {}
 
+                # ---- Stage 2 stochastic decomposition. The placement of every
+                # deployment is leaf-independent, so P_full is built once for ALL
+                # deployments; each leaf's routing distribution is read from its
+                # own last-level subproblem H and mapped back to original
+                # deployment indices via the active_workflow_list chain.
+                if stochastic_selection:
+                        _cache = {}
+
+                        def _load(path):
+                                if path not in _cache:
+                                        try:
+                                                with open(path, 'r') as f:
+                                                        _cache[path] = json.load(f)
+                                        except Exception:
+                                                _cache[path] = {}
+                                return _cache[path]
+
+                        def place_deployment(d, m):
+                                # Follow deployment d's function m down its placement
+                                # chain from the top and return its physical node.
+                                prev_selected_place = 0
+                                opt_num = 0
+                                curr_selected_workflow = d
+                                k_curr = 0
+                                for r in range(num_levels):
+                                        if r != 0:
+                                                opt_num = find_opt(opt_num, prev_selected_place, r)
+                                        curr_placement = _load(in_path("placement", f"opt_{w}_{opt_num}.json"))
+                                        curr_workflow = _load(in_path("workflows", f"requirements_workflow_{w}_{opt_num}.json"))
+                                        curr_P = curr_placement.get('P', [])
+                                        if r != 0:
+                                                try:
+                                                        awl = curr_workflow.get('active_workflow_list', [])
+                                                        if awl:
+                                                                curr_selected_workflow = find_correct_workflow(curr_selected_workflow, awl)
+                                                except Exception:
+                                                        pass
+                                        try:
+                                                selected_place = int(np.where(np.array(curr_P[curr_selected_workflow * num_funcs + m]) == 1)[0][0]) if curr_P else 0
+                                        except Exception:
+                                                selected_place = 0
+                                        if r == num_levels - 1:
+                                                try:
+                                                        k_curr = get_leaf(selected_place, opt_num)
+                                                except Exception:
+                                                        k_curr = selected_place
+                                        prev_selected_place = selected_place
+                                return k_curr
+
+                        def leaf_distribution(leaf):
+                                dist = [0.0] * deployment_number
+                                try:
+                                        pred_k_list, _lu, pos_list = upward_trajectory(leaf + num_other)
+                                except Exception:
+                                        return dist
+                                last = num_levels - 1
+                                opt_num = pred_k_list[last] + ind_start_list[last]
+                                sub = _load(in_path("placement", f"opt_{w}_{opt_num}.json"))
+                                Hsub = sub.get('H', [])
+                                csub = _load(in_path("cloud", f"requirements_cloud_{last}_{pred_k_list[last]}.json"))
+                                try:
+                                        leaves_pos = [j for j in range(csub['num_nodes']) if csub['providers'][f'provider_{j}'].get('leave')]
+                                        leaf_index = leaves_pos.index(pos_list[last])
+                                except Exception:
+                                        leaf_index = 0
+                                if leaf_index >= len(Hsub):
+                                        return dist
+                                Hrow = Hsub[leaf_index]
+                                # Map each local deployment ld up to the original (top)
+                                # deployment index by composing active_workflow_list.
+                                for ld in range(len(Hrow)):
+                                        if Hrow[ld] <= 0:
+                                                continue
+                                        d = ld
+                                        ok = True
+                                        for r in range(last, 0, -1):
+                                                onum = pred_k_list[r] + ind_start_list[r]
+                                                awl = _load(in_path("workflows", f"requirements_workflow_{w}_{onum}.json")).get('active_workflow_list', [])
+                                                if 0 <= d < len(awl):
+                                                        d = awl[d]
+                                                else:
+                                                        ok = False
+                                                        break
+                                        if ok and 0 <= d < deployment_number:
+                                                dist[d] = float(Hrow[ld])
+                                return dist
+
+                        for d in range(deployment_number):
+                                for m in range(num_funcs):
+                                        k_curr = place_deployment(d, m)
+                                        row_idx = d * num_funcs + m
+                                        while row_idx >= len(P_full):
+                                                P_full.append([0 for _ in range(num_nodes_all)])
+                                        if 0 <= k_curr < num_nodes_all:
+                                                P_full[row_idx][k_curr] = 1
+                        for leaf in range(num_leaves):
+                                H_full[leaf] = leaf_distribution(leaf)
+                        return {'P': P_full, 'H': H_full, 'L': L_full, 'a': a_full, 'b': b_full}
+
                 for leaf in range(num_leaves):
                         try:
                                 pred_k_list, lat_upward_list, pos_list = upward_trajectory(leaf + num_other)
@@ -382,27 +481,24 @@ if __name__ == "__main__":
                 b = sol_conf.get('b', [])
                 num_funcs = wf_conf.get('num_functions', 0)
                 perwf[w] = {}
-                for leaf in range(num_leaves):
-                        sel_work = 0
-                        try:
-                                sel_work = int(np.where(np.array(H[leaf]) == 1)[0][0]) if H else 0
-                        except Exception:
-                                sel_work = 0
+                num_deployment = wf_conf.get('deployment_number', 1)
+                num_paths_w = wf_conf.get('paths', {}).get('num_paths', 0)
 
+                # Execution plan (nodes/durations/rams) of a given deployment d;
+                # shared by the deterministic and stochastic paths.
+                def build_plan(d):
                         selected_places = []
                         for m in range(num_funcs):
                                 try:
-                                        row = P[sel_work * num_funcs + m]
+                                        row = P[d * num_funcs + m]
                                         selected_places.append(int(np.where(np.array(row) == 1)[0][0]))
                                 except Exception:
                                         selected_places.append(0)
-
-
                         durations = [0] * num_funcs
                         rams = [0] * num_funcs
                         for m in range(num_funcs):
                                 node = selected_places[m]
-                                node_name=node_conf["providers"][f"provider_{node}"]["name"]
+                                node_name = node_conf["providers"][f"provider_{node}"]["name"]
                                 try:
                                         func_conf = wf_conf['functions'][f"function_{m}"]
                                         base_time = func_conf.get('time', 0)
@@ -415,28 +511,69 @@ if __name__ == "__main__":
                                                 if node_name != "tinyfaas":
                                                         speedup = func_conf.get('speedup', 1)
                                                 else:
-                                                        speedup=1
+                                                        speedup = 1
                                         dur = int(np.ceil(speedup * base_time))
                                         durations[m] = dur
                                         rams[m] = func_conf.get('ram', 0)
                                 except Exception:
                                         durations[m] = 0
                                         rams[m] = 0
+                        return selected_places, durations, rams
 
-                        perwf[w][leaf] = {
-                                'selected_places': selected_places,
-                                'deployment': int(sel_work),
-                                'durations': durations,
-                                'rams': rams,
-                                'L': L
-                        }
+                def plan_base_T(sel_places, durs, lf):
+                        base_T_paths = []
+                        for s in range(num_paths_w):
+                                func_nums = np.where(np.array(b[s]) == 1)[0].tolist() if isinstance(b, (list, np.ndarray)) and len(b) > s else []
+                                tot = 0
+                                for idx_m in func_nums:
+                                        tot += durs[idx_m]
+                                        pos = func_nums.index(idx_m)
+                                        next_place = sel_places[func_nums[pos + 1]] if pos < len(func_nums) - 1 else lf + num_other
+                                        try:
+                                                tot += int(np.ceil(L[sel_places[idx_m]][next_place]))
+                                        except Exception:
+                                                pass
+                                base_T_paths.append(tot)
+                        return max(base_T_paths) if base_T_paths else 0
+
+                for leaf in range(num_leaves):
+                        if stochastic_selection:
+                                try:
+                                        dist = [max(0.0, float(x)) for x in H[leaf]]
+                                except Exception:
+                                        dist = [1.0] + [0.0] * (num_deployment - 1)
+                                tot_p = sum(dist)
+                                dist = [x / tot_p for x in dist] if tot_p > 0 else [1.0 / num_deployment] * num_deployment
+                                plans = {}
+                                for d in range(num_deployment):
+                                        if dist[d] <= 0:
+                                                continue
+                                        sp, du, rm = build_plan(d)
+                                        plans[d] = {
+                                                'selected_places': sp,
+                                                'durations': du,
+                                                'rams': rm,
+                                                'base_T': plan_base_T(sp, du, leaf),
+                                        }
+                                perwf[w][leaf] = {'dist': dist, 'plans': plans, 'L': L}
+                        else:
+                                sel_work = 0
+                                try:
+                                        sel_work = int(np.where(np.array(H[leaf]) == 1)[0][0]) if H else 0
+                                except Exception:
+                                        sel_work = 0
+                                selected_places, durations, rams = build_plan(sel_work)
+                                perwf[w][leaf] = {
+                                        'selected_places': selected_places,
+                                        'deployment': int(sel_work),
+                                        'durations': durations,
+                                        'rams': rams,
+                                        'L': L
+                                }
 
                 perwf[w]['a'] = a
                 perwf[w]['b'] = b
-                try:
-                        perwf[w]['num_paths'] = wf_conf.get('paths', {}).get('num_paths', 0)
-                except Exception:
-                        perwf[w]['num_paths'] = 0
+                perwf[w]['num_paths'] = num_paths_w
 
         # ---- Discrete-event simulation state (decomposed solution):
         # node_active[i] holds the currently running executions on node i as
@@ -460,6 +597,11 @@ if __name__ == "__main__":
         req_done_list = []
 
         rng = np.random.default_rng(42)
+        # Stage 2 stochastic decomposition: separate RNG for per-request deployment
+        # sampling (keeps the Poisson stream identical to the deterministic run),
+        # and per-(workflow, leaf, deployment) counters for the Monte-Carlo cost.
+        rng_sel = np.random.default_rng(123)
+        sel_counts = [[{} for _ in range(num_leaves)] for _ in range(num_workflows)]
 
         # Simulate second by second: sample Poisson arrivals for every
         # (workflow, leaf) pair, then execute them under the two blocking
@@ -663,41 +805,52 @@ if __name__ == "__main__":
                                         info = perwf.get(w, {}).get(leaf, None)
                                         if info is None:
                                                 continue
-                                        sel_places = info['selected_places']
-                                        durs = info['durations']
-                                        rams = info['rams']
                                         Lmat = info['L']
-                                        deployment_id = int(info.get('deployment', w))
-
-                                        base_T_paths = []
                                         a_mat = perwf[w].get('a', [])
                                         b_mat = perwf[w].get('b', [])
                                         num_paths_local = perwf[w].get('num_paths', 0)
-                                        for s in range(num_paths_local):
-                                                func_nums = np.where(np.array(b_mat[s])==1)[0].tolist() if isinstance(b_mat, (list, np.ndarray)) and len(b_mat) > s else []
-
-                                                tot = 0
-                                                for idx_m in func_nums:
-                                                        tot += durs[idx_m]
-
-                                                        if idx_m < len(func_nums) - 1:
-                                                                next_m = func_nums[func_nums.index(idx_m) + 1]
-                                                                next_place = sel_places[next_m]
-                                                        else:
-                                                                next_place = leaf + num_other
-                                                        try:
-                                                                tot += int(np.ceil(Lmat[sel_places[idx_m]][next_place]))
-                                                        except Exception:
-                                                                pass
-                                                base_T_paths.append(tot)
-                                        base_T = max(base_T_paths) if base_T_paths else 0
-
+                                        if not stochastic_selection:
+                                                sel_places = info['selected_places']
+                                                durs = info['durations']
+                                                rams = info['rams']
+                                                deployment_id = int(info.get('deployment', w))
+                                                base_T_paths = []
+                                                for s in range(num_paths_local):
+                                                        func_nums = np.where(np.array(b_mat[s])==1)[0].tolist() if isinstance(b_mat, (list, np.ndarray)) and len(b_mat) > s else []
+                                                        tot = 0
+                                                        for idx_m in func_nums:
+                                                                tot += durs[idx_m]
+                                                                if idx_m < len(func_nums) - 1:
+                                                                        next_m = func_nums[func_nums.index(idx_m) + 1]
+                                                                        next_place = sel_places[next_m]
+                                                                else:
+                                                                        next_place = leaf + num_other
+                                                                try:
+                                                                        tot += int(np.ceil(Lmat[sel_places[idx_m]][next_place]))
+                                                                except Exception:
+                                                                        pass
+                                                        base_T_paths.append(tot)
+                                                base_T = max(base_T_paths) if base_T_paths else 0
 
                                         # Resolve each arriving request immediately: walk every
                                         # branch function-by-function, booking each execution at
                                         # the earliest time slot that satisfies the RAM and
                                         # function-busy blocking rules.
                                         for i in range(n):
+                                                if stochastic_selection:
+                                                        # Sample this request's deployment from the leaf
+                                                        # policy and use that deployment's plan/base_T.
+                                                        dist = info['dist']
+                                                        d_sel = int(rng_sel.choice(len(dist), p=dist))
+                                                        plan = info['plans'].get(d_sel)
+                                                        if plan is None:
+                                                                continue
+                                                        sel_places = plan['selected_places']
+                                                        durs = plan['durations']
+                                                        rams = plan['rams']
+                                                        base_T = plan['base_T']
+                                                        deployment_id = d_sel
+                                                        sel_counts[w][leaf][d_sel] = sel_counts[w][leaf].get(d_sel, 0) + 1
                                                 arrival = cur_t
                                                 path_finish_times = []
 
@@ -831,14 +984,22 @@ if __name__ == "__main__":
                 num_nodes_all=sum(num_nodes_in_level[-1])
                 invocations=np.zeros(num_nodes_all)
                 placement_overall=0
-                for k in range(num_leaves):
+                # Monetary cost per (leaf, deployment): deterministic weights the
+                # top-level regional selection by all requests at the leaf; stochastic
+                # weights each deployment by how many requests actually sampled it
+                # (Monte-Carlo expectation over the routing policy).
+                if stochastic_selection:
+                        work_items = [(k, d, c) for k in range(num_leaves) for d, c in sel_counts[t][k].items()]
+                else:
+                        work_items = []
+                        for k in range(num_leaves):
+                                _pkl, _lu, _pl = upward_trajectory(k + num_other)
+                                work_items.append((k, H[_pkl[1] - num_other_first_level].index(1), overall_requests[t, k]))
+                for k, selected_workflow, weight in work_items:
 
                         # Which deployment serves this leaf: read the selection H of
                         # the top-level problem for the leaf's level-1 region.
                         pred_k_list, lat_upward_list,pos_list = upward_trajectory(k+num_other)
-
-                        selected_workflow = H[
-                                pred_k_list[1] - num_other_first_level].index(1)
 
                         workflow_overall[selected_workflow]+=1
                         time_cost=0
@@ -883,15 +1044,26 @@ if __name__ == "__main__":
                                                 if r==0:
 
                                                         curr_selected_workflow = selected_workflow
-                                                        selected_place = P[selected_workflow * num_functions + m].index(
-                                                                1)
+                                                        try:
+                                                                selected_place = P[selected_workflow * num_functions + m].index(1)
+                                                        except (ValueError, IndexError):
+                                                                selected_place = 0
                                                 else:
 
-                                                        curr_selected_workflow=find_correct_workflow(curr_selected_workflow,curr_workflow["active_workflow_list"])
+                                                        try:
+                                                                curr_selected_workflow=find_correct_workflow(curr_selected_workflow,curr_workflow["active_workflow_list"])
+                                                        except (ValueError, IndexError):
+                                                                pass
                                                 if curr_P==[]:
                                                         selected_place=0
                                                 else:
-                                                        selected_place=curr_P[curr_selected_workflow*num_functions+m].index(1)
+                                                        # A sampled deployment whose function m is placed in
+                                                        # another region appears here only virtually (pinned to
+                                                        # the head node 0); default there if no explicit 1.
+                                                        try:
+                                                                selected_place=curr_P[curr_selected_workflow*num_functions+m].index(1)
+                                                        except (ValueError, IndexError):
+                                                                selected_place=0
 
                                                 if r==0:
                                                         # Top level: dependency-data transfer cost (if the
@@ -1003,9 +1175,9 @@ if __name__ == "__main__":
 
 
 
-                        time_cost_all+=overall_requests[t,k]*time_cost
+                        time_cost_all+=weight*time_cost
 
-                        money_cost_all+=overall_requests[t,k]*money_cost
+                        money_cost_all+=weight*money_cost
                 select_cost=np.sum(workflow_overall**2)+np.sum(invocations**2)
                 select_cost_all+=select_cost
 

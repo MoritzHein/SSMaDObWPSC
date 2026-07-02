@@ -54,8 +54,12 @@ def _stochastic_selection_targets(H, current_node, n_list, parent_cloud):
     num_local = len(n_list)
     flow_rhs = [0.0] * num_local
     outside_routing = [0.0] * num_local
+    # head_has_own = the parent node this region refines is itself a user leaf, so
+    # the region's head node carries real own-user demand to conserve. If it is a
+    # non-leaf (e.g. a cloud node), the head's rate is phantom => own demand is 0
+    # and its whole rate is virtual (handled in solve_opt).
     if parent_cloud is None or H is None or getattr(H, "shape", (0,))[0] == 0:
-        return flow_rhs, outside_routing
+        return flow_rhs, outside_routing, True
     providers = parent_cloud["providers"]
     ncols = H.shape[1]
 
@@ -66,6 +70,7 @@ def _stochastic_selection_targets(H, current_node, n_list, parent_cloud):
     parent_leaves = [j for j in range(parent_cloud["num_nodes"])
                      if providers[f"provider_{j}"].get("leave", False)]
     leaf_pos = {j: i for i, j in enumerate(parent_leaves)}
+    head_has_own = current_node in leaf_pos
 
     if current_node in leaf_pos:
         rep = leaf_pos[current_node]
@@ -82,7 +87,7 @@ def _stochastic_selection_targets(H, current_node, n_list, parent_cloud):
                 outside_routing[l] = sum(
                     own_rate(j) * float(H[leaf_pos[j]][n]) for j in others
                     if leaf_pos[j] < H.shape[0]) / tot
-    return flow_rhs, outside_routing
+    return flow_rhs, outside_routing, head_has_own
 
 
 def update_requirements_config(requirements_workflow_config, P,H, current_node,current_leave_k, num_nodes,seed=42,parent_cloud_config=None,stochastic_selection=False):
@@ -113,10 +118,11 @@ def update_requirements_config(requirements_workflow_config, P,H, current_node,c
             # real users of this region must reproduce (flow_rhs) and the routing
             # of the outside/virtual demand (outside_routing). Both are indexed by
             # the local (n_list) deployment order.
-            flow_rhs, outside_routing = _stochastic_selection_targets(
+            flow_rhs, outside_routing, head_has_own = _stochastic_selection_targets(
                 H, current_node, n_list, parent_cloud_config)
             requirements_workflow_config["flow_rhs"] = flow_rhs
             requirements_workflow_config["outside_routing"] = outside_routing
+            requirements_workflow_config["head_has_own"] = bool(head_has_own)
             requirements_workflow_config["selection_list"] = {}
         else:
             # Deterministic: deployments selected by at least one upper-level leaf

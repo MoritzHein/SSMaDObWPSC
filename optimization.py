@@ -126,6 +126,32 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
     # this already aggregates the rates of the underlying region (Eqs. (2)/(7)).
     for k in range(num_leaves):
         request[k]=deployment_cloud['providers'][f"provider_{leave_nodes[k]}"]["request_rate"]
+    # ---- Stage 2 stochastic decomposition. When a lower-level subproblem carries
+    # an inherited flow policy (flow_rhs from update_requirements_config), node 0
+    # (leaf 0, the head) is treated as a normal leaf for its OWN users only (its
+    # rate is de-conflated by subtracting the virtual/outside demand), and the
+    # virtual demand is added separately as a fixed pseudo-leaf routed by
+    # outside_routing. Absent flow_rhs (top-level decomposed / centralized) =>
+    # unchanged Stage-1 behavior.
+    stochastic_decomp = relax_selection and ("flow_rhs" in deployment_workflow)
+    head_has_own = deployment_workflow.get("head_has_own", True)
+    flow_rhs = deployment_workflow.get('flow_rhs', [0.0] * num_workflows)
+    outside_routing = deployment_workflow.get('outside_routing', [0.0] * num_workflows)
+    head_virtual = float(deployment_cloud['providers']['provider_0'].get('virtual_request_rate', 0.0))
+    # Head node (leaf 0) de-conflation. If the parent node this region refines is a
+    # real user leaf, the head's own share is (head_rate - virtual) and the outside
+    # stream = virtual. If it is a non-leaf (cloud) node, the head carries no own
+    # user demand (own = 0) and its entire rate is the virtual/outside stream --
+    # this keeps Sum_k own_k = Sum_n flow_rhs and the flow conservation feasible.
+    if stochastic_decomp:
+        virtual_rate = head_virtual if head_has_own else request[0][0]
+        own_head = (request[0][0] - head_virtual) if head_has_own else 0.0
+    else:
+        virtual_rate = 0.0
+        own_head = 0.0
+    # Effective per-leaf rate for the H-weighted objective/utilization terms.
+    lam = [(own_head if (stochastic_decomp and leave_nodes[k] == 0) else request[k][0])
+           for k in range(num_leaves)]
     # Assemble the per-function cost parameters C, D and D_in from the node
     # pricing (cf. Sec. II-B: C_{m,i} = p_RAM,i*R_func,m + p_data,i*d_data,m and
     # D_{m,i,j} = (p_send,i + p_send,j)*d_sent,m).
@@ -250,13 +276,21 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         # cost M of executing functions and transferring data between them.
         for n in range( num_workflows):
             for k in range( num_leaves):
-                obj=obj+request[k][0]*H[k,n]*w_2*T[n]
+                obj=obj+lam[k]*H[k,n]*w_2*T[n]
                 for m in range( num_functions):
                     for i in range(num_nodes):
-                        obj=obj+request[k][0]*H[k,n]*(w_1*(P[m+n* num_functions,i]*C[m,i]+S[m+n* num_functions,i]))#S[m+n* num_functions,i]*D[m,i]
+                        obj=obj+lam[k]*H[k,n]*(w_1*(P[m+n* num_functions,i]*C[m,i]+S[m+n* num_functions,i]))#S[m+n* num_functions,i]*D[m,i]
                         #for m_s in range(num_functions):
                             #for j in range(num_nodes):
                                 #obj=obj+H[k,n]*P[m+n*num_functions,i]*P[m_s+n*num_functions,j]*D[m,i]*a[m,m_s]
+            # Fixed virtual/outside demand for deployment n: same time + money
+            # cost terms weighted by the pinned outside routing (no H variable).
+            if stochastic_decomp:
+                vw = virtual_rate * outside_routing[n]
+                obj = obj + vw*w_2*T[n]
+                for m in range(num_functions):
+                    for i in range(num_nodes):
+                        obj = obj + vw*(w_1*(P[m+n*num_functions,i]*C[m,i]+S[m+n*num_functions,i]))
         # "Virtual placements" of the decomposition (Eq. (3) of the paper):
         # functions that the upper level placed OUTSIDE this region are pinned
         # to node 0 (the head node), because all communication to other regions
@@ -277,9 +311,18 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
             for k in range( num_leaves):
                 for i in range(num_nodes):
                     for m in m_start:
-                        obj=obj+request[k][0]*H[k,n]*( P[n*num_functions+m,i]*w_1*D_in[i]+w_2*L[leave_nodes[k],i]*P[n*num_functions+m,i])# P[n*num_functions+m,i]*w_1*D_in[i]
+                        obj=obj+lam[k]*H[k,n]*( P[n*num_functions+m,i]*w_1*D_in[i]+w_2*L[leave_nodes[k],i]*P[n*num_functions+m,i])# P[n*num_functions+m,i]*w_1*D_in[i]
                     for m in m_end:
-                        obj= obj+request[k][0]*H[k,n]*(w_1*D[m,i,k]*P[n*num_functions+m, i]+w_2*L[leave_nodes[k], i] * P[n*num_functions+m, i])
+                        obj= obj+lam[k]*H[k,n]*(w_1*D[m,i,k]*P[n*num_functions+m, i]+w_2*L[leave_nodes[k], i] * P[n*num_functions+m, i])
+            # Fixed virtual/outside demand: enters and exits through the head
+            # node 0 (all outside communication is routed through it).
+            if stochastic_decomp:
+                vw = virtual_rate * outside_routing[n]
+                for i in range(num_nodes):
+                    for m in m_start:
+                        obj = obj + vw*( P[n*num_functions+m,i]*w_1*D_in[i]+w_2*L[0,i]*P[n*num_functions+m,i])
+                    for m in m_end:
+                        obj = obj + vw*(w_1*D[m,i,0]*P[n*num_functions+m,i]+w_2*L[0,i]*P[n*num_functions+m,i])
 
 
         # Function utilization u_{n,m} = sum_k lambda_k H_{k,n} P_{n,m,i} t_{m,i}
@@ -288,7 +331,8 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         # through the same function instance (reduces blocking/waiting time).
         for n in range(num_workflows):
             for m in range(num_functions):
-                model.addConstr(p[n*num_functions+m]==quicksum(quicksum(request[k][0]*H[k,n]*P[n*num_functions,i]*Time[m]*Speed[m][i] for k in range(num_leaves)) for i in range(num_nodes)))
+                virt_u = (virtual_rate*outside_routing[n])*quicksum(P[n*num_functions,i]*Time[m]*Speed[m][i] for i in range(num_nodes)) if stochastic_decomp else 0
+                model.addConstr(p[n*num_functions+m]==quicksum(quicksum(lam[k]*H[k,n]*P[n*num_functions,i]*Time[m]*Speed[m][i] for k in range(num_leaves)) for i in range(num_nodes))+virt_u)
                 obj+=w_3*p[n*num_functions+m]**2
         # Node utilization M_i (share of RAM_max,i expected to be occupied,
         # on top of the utilization left by previously placed workflows).
@@ -298,12 +342,14 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
             curr_util=deployment_cloud["providers"][f"provider_{i}"]["utilization"]
 
             if i ==0:
-                model.addConstr(M[i] == (quicksum(quicksum(request[k][0]*H[k,n]*(quicksum(P[n * num_functions + m, i]*Time[m]*ram[m] for m in range(num_functions))-sum([already_placed[n,m]*Time[m]*ram[m] for m in range(num_functions)])) for k in range(num_leaves)) for n in range(num_workflows)))/ram_max[i]+curr_util,
+                virt_M = quicksum((virtual_rate*outside_routing[n])*(quicksum(P[n * num_functions + m, i]*Time[m]*ram[m] for m in range(num_functions))-sum([already_placed[n,m]*Time[m]*ram[m] for m in range(num_functions)])) for n in range(num_workflows)) if stochastic_decomp else 0
+                model.addConstr(M[i] == (quicksum(quicksum(lam[k]*H[k,n]*(quicksum(P[n * num_functions + m, i]*Time[m]*ram[m] for m in range(num_functions))-sum([already_placed[n,m]*Time[m]*ram[m] for m in range(num_functions)])) for k in range(num_leaves)) for n in range(num_workflows))+virt_M)/ram_max[i]+curr_util,
                                 "Aux cons")
             else:
+                virt_M = quicksum((virtual_rate*outside_routing[n])*quicksum(P[n * num_functions + m, i]*Time[m]*ram[m] for m in range(num_functions)) for n in range(num_workflows)) if stochastic_decomp else 0
                 model.addConstr(M[i] == (quicksum(quicksum(
-                    quicksum(request[k][0]*H[k, n] * P[n * num_functions + m, i]*Time[m]*ram[m] for m in range(num_functions)) for k in
-                    range(num_leaves)) for n in range(num_workflows)))/ram_max[i]+curr_util,
+                    quicksum(lam[k]*H[k, n] * P[n * num_functions + m, i]*Time[m]*ram[m] for m in range(num_functions)) for k in
+                    range(num_leaves)) for n in range(num_workflows))+virt_M)/ram_max[i]+curr_util,
                                 "Aux cons")
             obj+=w_3*M[i]**2#quicksum(H[r,n]*M[i,n] for r in range(num_leaves))
         # The three penalty/cost groups above form the utilization cost U of Eq. (1).
@@ -335,6 +381,14 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         else:
             for k in range(num_leaves):
                 model.addConstr(quicksum(H[k, n] for n in range(num_workflows)) == 1, "only one selected")
+            # Stage 2: real-user demand conservation. Each leaf freely distributes
+            # (simplex above), but the region's OWN-rate aggregate per deployment
+            # must reproduce the parent's allocation flow_rhs[n] = lambda_rep *
+            # H_parent[rep,n]. Node 0 contributes only its own share (lam[0]); the
+            # virtual demand is handled by the fixed outside_routing terms above.
+            if stochastic_decomp:
+                for n in range(num_workflows):
+                    model.addConstr(quicksum(lam[k]*H[k, n] for k in range(num_leaves)) == flow_rhs[n], "flow_conservation")
         #for n in range( num_workflows):
         #    model.addConstr(quicksum(H[k,n] for k in range( num_leaves))>=1,"place differently")
         #for i in range( num_nodes):

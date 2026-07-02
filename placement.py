@@ -133,7 +133,7 @@ if __name__ == "__main__":
                 # Solve the regional placement subproblem (Eq. (1)) with Gurobi
                 # and store all solution matrices and model parameters as JSON
                 # so that selection_simulation.py can re-evaluate the costs.
-                model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M=solve_opt(requirements_workflow_config,requirements_cloud_config,gap=own_gap,w_1=w_1,w_2=w_2,w_3=w_3,provider_name_list=provider_list,provider_cost_list=provider_cost_list)
+                model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M=solve_opt(requirements_workflow_config,requirements_cloud_config,gap=own_gap,w_1=w_1,w_2=w_2,w_3=w_3,provider_name_list=provider_list,provider_cost_list=provider_cost_list,relax_selection=stochastic_selection)
                 solution=dict()
                 solution['P']=P.tolist()
                 solution['H']=H.tolist()
