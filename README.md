@@ -94,11 +94,32 @@ This generates its own scenarios under `sensitivity/run_N/scale_sweep/` and
 writes `results/run_N/sensitivity/scale_sweep_summary.json` (optional
 `--factors=0.5,1.0,2.0` and `--params=latency,time`).
 
+The sweep evaluates the *fixed nominal* placement under wrong parameters. To
+also see how it compares against re-planning, add `--adapt`:
+
+```run_scale_sweep.py --num_run=N --adapt```
+
+For every sweep point this additionally re-solves the placement (and the
+centralized/heuristic comparison, per the run's settings) with the parameters
+adapted to the perturbed values, inside a self-contained sandbox
+`sensitivity/run_N/scale_sweep/<param>/factor_<tag>/adapted/` (mirroring the
+usual `settings/cloud/workflows/placement/results` layout, so the baseline run
+is never touched). The adapted costs are added to the summary as
+`adapted_overall_cost` / `adapted_overall_cost_comparison`. Note: this runs one
+full placement solve per sweep point (with a centralized comparison that is a
+full-architecture MIQP each time) and stores one full run folder per point, so
+use it with a small `--factors`/`--params` selection on large runs. The
+adapted run at factor 1.0 reproduces the baseline exactly (sanity check).
+
 To plot the study run
 
 ```visualization_sensitivity.py --num_run=N```
 
-which saves a tornado chart, per-parameter response curves, a distribution
-overview of the combined study, and a regression-based estimate of the
-individual effects to `results/run_N/` (each covers both the decomposed and the
-comparison solution).
+which saves a tornado chart, per-parameter response curves (with the adapted
+placement overlaid as dashed lines when `--adapt` data exists), an
+adaptation-offset chart (absolute and relative regret of keeping the nominal
+placement instead of re-planning), a distribution overview of the combined
+study, and a regression-based estimate of the individual effects to
+`results/run_N/`. Each figure covers both the decomposed and the comparison
+solution, and the titles state whether the comparison is the centralized
+optimization or the heuristic (read from `settings/parameters_N.json`).

@@ -16,6 +16,7 @@ import argparse
 import os.path
 from cloud_workflow_setup import *
 from optimization import *
+from generate_sensitivity_scenarios import apply_scale_to_pristine, CLOUD_PARAMS, WORKFLOW_PARAMS
 import time
 
 if __name__ == "__main__":
@@ -23,7 +24,20 @@ if __name__ == "__main__":
         description="Script that adds 3 numbers from CMD"
     )
     parser.add_argument("--num_run", required=False, type=int, default=None)
+    # Adapted-placement mode for the sensitivity scale sweep (run_scale_sweep.py
+    # --adapt): uniformly scale ONE uncertain parameter of the freshly generated
+    # pristine inputs before solving, so the placement adapts to the perturbed
+    # world instead of the nominal one. Absent => unchanged behavior.
+    parser.add_argument("--scale_param", required=False, type=str, default=None,
+                        choices=CLOUD_PARAMS + WORKFLOW_PARAMS,
+                        help="Uncertain parameter to scale before solving (adapted placement).")
+    parser.add_argument("--scale_factor", required=False, type=float, default=None,
+                        help="Scale factor applied to --scale_param.")
     args = parser.parse_args()
+    if (args.scale_param is None) != (args.scale_factor is None):
+        parser.error("--scale_param and --scale_factor must be given together.")
+    scale_param = args.scale_param
+    scale_factor = args.scale_factor
     num_run=args.num_run
     if num_run is None:
         while True:
@@ -61,6 +75,10 @@ if __name__ == "__main__":
     # Sample the hierarchical serverless architecture: one cloud config file per
     # (level, region) pair plus a general_config.json describing the hierarchy.
     generate_cloud(num_levels,num_run=num_run,provider_name=provider_list,provider_dev=provider_dev,num_tiny_first=num_tiny_first,provider_cost_list=provider_cost_list,config_random_cloud=config_random_cloud,seed=seed)
+    # Adapted placement: scale the pristine cloud parameters before anything
+    # (including general_config.json, read next) is consumed.
+    if scale_param in CLOUD_PARAMS:
+        apply_scale_to_pristine(scale_param, scale_factor, f"cloud/run_{num_run}", f"workflows/run_{num_run}")
     general_config_path = f"cloud/run_{num_run}/general_config.json"
     with open(general_config_path, "r") as f:
         cloud_general_config = json.load(f)
@@ -75,6 +93,10 @@ if __name__ == "__main__":
     # one copy of each workflow file is written per subproblem because the
     # configs are modified in place while descending the hierarchy.
     workflow_name_list=generate_random_workflows(num_workflows=num_workflows,config_random_workflows=config_random_workflows,provider_name=provider_list, num_opts=ges_nodes,num_run=num_run,seed=seed)
+    # Adapted placement: scale the pristine workflow parameters (all subproblem
+    # copies) before the descent mutates them.
+    if scale_param in WORKFLOW_PARAMS:
+        apply_scale_to_pristine(scale_param, scale_factor, f"cloud/run_{num_run}", f"workflows/run_{num_run}")
     # load the deployment configuration
     t1=time.time()
     comp_time=[]

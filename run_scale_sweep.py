@@ -12,9 +12,20 @@
 # evaluates the fixed placement against each via selection_simulation.py, and
 # aggregates the costs into results/run_<N>/sensitivity/scale_sweep_summary.json
 # (consumed by visualization_sensitivity.py).
+#
+# With --adapt, every sweep point additionally gets an ADAPTED baseline: the
+# placement (and the centralized/heuristic comparison, per the run's settings)
+# is re-solved with the parameters scaled to the perturbed values, so the cost
+# of keeping the stale nominal placement can be separated from the cost of the
+# perturbation itself. Each adapted run lives in a self-contained sandbox
+# sensitivity/run_<N>/scale_sweep/<param>/factor_<tag>/adapted/ and its costs
+# are added to the summary as adapted_overall_cost(_comparison). Note the cost:
+# one full placement solve per sweep point (a centralized comparison solve is
+# a full-architecture MIQP each time), and one full run folder of storage.
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -41,6 +52,31 @@ def factor_tag(f):
     return ("%g" % f).replace(".", "p").replace("-", "m")
 
 
+def run_adapted(num_run, param, factor, point_dir):
+    """Adapted baseline for one sweep point: re-solve the placement with the
+    pristine inputs scaled by `factor` (placement.py --scale_param/--scale_factor)
+    and simulate it. Runs inside a sandbox <point_dir>/adapted/ that mirrors the
+    standard {settings,cloud,workflows,placement,results}/run_<N> layout, so
+    both scripts run unmodified with cwd=<sandbox> (their paths are cwd-relative;
+    imports resolve via the script's own directory). Returns the sandbox
+    results.json contents."""
+    sandbox = os.path.join(point_dir, "adapted")
+    for d in ("settings", "cloud", "workflows", "placement", "results"):
+        os.makedirs(os.path.join(sandbox, d), exist_ok=True)
+    shutil.copyfile(os.path.join("settings", f"parameters_{num_run}.json"),
+                    os.path.join(sandbox, "settings", f"parameters_{num_run}.json"))
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    subprocess.run(
+        [sys.executable, os.path.join(repo_dir, "placement.py"),
+         f"--num_run={num_run}", f"--scale_param={param}", f"--scale_factor={factor}"],
+        cwd=sandbox, check=True)
+    subprocess.run(
+        [sys.executable, os.path.join(repo_dir, "selection_simulation.py"),
+         f"--num_run={num_run}"],
+        cwd=sandbox, check=True)
+    return load_json(os.path.join(sandbox, "results", f"run_{num_run}", "results.json"))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_run", required=False, type=int, default=None)
@@ -48,6 +84,12 @@ def main():
                         help="Comma-separated scale factors (default 0.5,0.75,1.0,1.25,1.5,2.0).")
     parser.add_argument("--params", required=False, type=str, default=None,
                         help="Comma-separated parameters to sweep (default all five).")
+    parser.add_argument("--adapt", action="store_true",
+                        help="Additionally re-solve the placement (and the comparison, "
+                             "per the run's settings) for every sweep point with the "
+                             "parameters adapted to the perturbed values, as a "
+                             "re-planning baseline. Stored under "
+                             "sensitivity/run_<N>/scale_sweep/<param>/factor_<tag>/adapted/.")
     args = parser.parse_args()
     num_run = args.num_run
     if num_run is None:
@@ -85,6 +127,9 @@ def main():
     for param in params:
         print(f"\n=== Sweeping {param} ===")
         per_param = {"factors": [], "overall_cost": [], "overall_cost_comparison": []}
+        if args.adapt:
+            per_param["adapted_overall_cost"] = []
+            per_param["adapted_overall_cost_comparison"] = []
         for f in factors:
             sens = {p: {"mode": "off"} for p in ALL_PARAMS}
             sens[param] = {"mode": "scale", "factor": f, "per_element": False}
@@ -108,6 +153,13 @@ def main():
             per_param["factors"].append(f)
             per_param["overall_cost"].append(res.get("overall_cost"))
             per_param["overall_cost_comparison"].append(res.get("overall_cost_comparison"))
+
+            if args.adapt:
+                print(f"  {param} x{f} adapted placement ...")
+                adapted = run_adapted(num_run, param, f, out_dir)
+                per_param["adapted_overall_cost"].append(adapted.get("overall_cost"))
+                per_param["adapted_overall_cost_comparison"].append(
+                    adapted.get("overall_cost_comparison"))
         sweep[param] = per_param
 
     out_dir = os.path.join("results", f"run_{num_run}", "sensitivity")
@@ -124,6 +176,8 @@ def main():
         },
         "params": sweep,
     }
+    if args.adapt:
+        summary["adapt"] = True
     out_path = os.path.join(out_dir, "scale_sweep_summary.json")
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=4)
@@ -134,6 +188,10 @@ def main():
         costs = [c for c in sweep[param]["overall_cost"] if isinstance(c, (int, float))]
         if costs:
             print(f"  {param:13s} overall_cost range [{min(costs):.4g}, {max(costs):.4g}]")
+        acosts = [c for c in sweep[param].get("adapted_overall_cost", [])
+                  if isinstance(c, (int, float))]
+        if acosts:
+            print(f"  {param:13s} adapted overall_cost range [{min(acosts):.4g}, {max(acosts):.4g}]")
 
 
 if __name__ == "__main__":

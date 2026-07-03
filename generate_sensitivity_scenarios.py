@@ -32,6 +32,9 @@ import numpy as np
 
 # Parameters that live in the workflow function configs.
 WORKFLOW_PARAMS = ["time", "speedup", "ram"]
+# Parameters that live in the pristine cloud files (region configs +
+# general_config.json).
+CLOUD_PARAMS = ["request_rate", "latency"]
 
 
 def draw_factor(rng, cfg):
@@ -197,6 +200,81 @@ def perturb_workflows(rng, sens, workflow_dir, out_dir, manifest):
             "factor_mean": float(np.mean(vals)),
             "factor_max": max(vals),
         }
+
+
+def _scale_nested(x, factor):
+    """Multiply every number inside an arbitrarily nested list structure."""
+    if isinstance(x, list):
+        return [_scale_nested(v, factor) for v in x]
+    if isinstance(x, (int, float)):
+        return x * factor
+    return x
+
+
+def apply_scale_to_pristine(param, factor, cloud_dir, workflow_dir):
+    """Uniformly scale one uncertain parameter of the PRISTINE inputs, in place.
+
+    Used by placement.py --scale_param/--scale_factor for the adapted-placement
+    runs of the scale sweep (run_scale_sweep.py --adapt). A uniform factor on
+    the pristine inputs commutes with the architecture generation, so the
+    adapted placement is solved against exactly the perturbed world that the
+    nominal sweep's scenario overlay simulates:
+
+      - request_rate: request_rate AND virtual_request_rate of every provider
+        in every region cloud file, plus request_list in general_config.json
+        (the source of the full-cloud rates in generate_full_cloud);
+      - latency: estimated_latency of every provider in every region cloud
+        file, plus latencies_list in general_config.json (the source of the
+        full-cloud latency reconstruction);
+      - time / speedup / ram: that field of every function in every workflow
+        file (all subproblem copies).
+
+    factor == 1.0 is a no-op, so an adapted run at factor 1 reproduces the
+    baseline problem bit-identically (sanity anchor of the sweep)."""
+    factor = float(factor)
+    if factor == 1.0:
+        return
+
+    if param in WORKFLOW_PARAMS:
+        for src in sorted(glob.glob(os.path.join(workflow_dir, "requirements_workflow_*.json"))):
+            with open(src, "r") as f:
+                conf = json.load(f)
+            for fdict in conf.get("functions", {}).values():
+                if param in fdict:
+                    fdict[param] = fdict[param] * factor
+            with open(src, "w") as f:
+                json.dump(conf, f, indent=4)
+        return
+
+    if param not in CLOUD_PARAMS:
+        raise ValueError(f"Unknown scale parameter '{param}'. "
+                         f"Choose from {CLOUD_PARAMS + WORKFLOW_PARAMS}.")
+
+    region_re = re.compile(r"requirements_cloud_\d+_\d+\.json$")
+    for src in sorted(glob.glob(os.path.join(cloud_dir, "requirements_cloud_*_*.json"))):
+        if not region_re.search(os.path.basename(src)):
+            continue
+        with open(src, "r") as f:
+            conf = json.load(f)
+        for prov in conf.get("providers", {}).values():
+            if param == "request_rate":
+                if "request_rate" in prov:
+                    prov["request_rate"] = prov["request_rate"] * factor
+                if "virtual_request_rate" in prov:
+                    prov["virtual_request_rate"] = prov["virtual_request_rate"] * factor
+            else:
+                if "estimated_latency" in prov:
+                    prov["estimated_latency"] = _scale_nested(prov["estimated_latency"], factor)
+        with open(src, "w") as f:
+            json.dump(conf, f, indent=4)
+
+    gc_path = os.path.join(cloud_dir, "general_config.json")
+    with open(gc_path, "r") as f:
+        general_config = json.load(f)
+    key = "request_list" if param == "request_rate" else "latencies_list"
+    general_config[key] = _scale_nested(general_config[key], factor)
+    with open(gc_path, "w") as f:
+        json.dump(general_config, f, indent=4)
 
 
 def main():
