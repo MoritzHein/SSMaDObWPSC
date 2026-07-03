@@ -150,7 +150,7 @@ def plot_response_curves(sweep, export_path, targets):
     if not params:
         return
     any_adapted = False
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.5), sharex=True)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.5), sharex=True,sharey=True)
     for ax, (target, title) in zip(np.atleast_1d(axes), targets):
         base = sweep.get("baseline", {}).get(target)
         for p in params:
@@ -206,7 +206,7 @@ def plot_adaptation_offset(sweep, export_path, targets):
         return
     ncols = len(have)
     fig, axes = plt.subplots(2, ncols, figsize=(4.5 * ncols, 6),
-                             sharex=True, squeeze=False)
+                             sharex=True, sharey='row', squeeze=False)
     for col_i, (target, title) in enumerate(have):
         ax_abs, ax_rel = axes[0][col_i], axes[1][col_i]
         for p in params:
