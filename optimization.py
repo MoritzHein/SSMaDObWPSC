@@ -389,7 +389,10 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
             for n in  deployment_workflow["selection_list"]:
                 for k in range(num_leaves):
                     model.addConstr(H[k,n]==1)
-        else:
+        elif num_workflows > 0:
+            # (num_workflows == 0: a fully pruned region has no deployments to
+            # select -- adding the simplex constraint would be an unsatisfiable
+            # 0 == 1.)
             for k in range(num_leaves):
                 model.addConstr(quicksum(H[k, n] for n in range(num_workflows)) == 1, "only one selected")
             # Stage 2: real-user demand conservation. Each leaf freely distributes
@@ -448,6 +451,15 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
             # model (P, S, H, T, M, p), so the running index r/s walks through
             # each block row-by-row.
             model.optimize()
+            # An infeasible/unbounded subproblem means the decomposition's
+            # demand/pruning bookkeeping is inconsistent -- never write a
+            # degenerate solution for it (that silently corrupts the run).
+            if model.status != GRB.OPTIMAL:
+                raise RuntimeError(
+                    f"Subproblem {deployment_workflow.get('name', '?')}: Gurobi "
+                    f"finished with status {model.status} (2 = OPTIMAL). The "
+                    f"model is infeasible/unbounded or the solve failed; the "
+                    f"decomposition bookkeeping for this region is inconsistent.")
 
             t2=time.time()
             t=t2-t1
@@ -502,7 +514,9 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
                     s=s+1
             obj=model.getObjective()
         except:
-            pass
+            # Never swallow solver errors: a silently returned zero solution
+            # corrupts the whole downstream run (see run_132 diagnosis).
+            raise
     P_list.append(P)
     #print(obj)
     print(P)

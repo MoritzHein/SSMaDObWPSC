@@ -56,7 +56,13 @@ def update_cloud_config(requirements_cloud_config, requirements_workflow_config,
 # stream, so parent_outside_rate = 0 reproduces the non-recursive formula.
 def _stochastic_selection_targets(H, current_node, n_list, parent_cloud,
                                   parent_outside_rate=0.0,
-                                  parent_outside_routing=None):
+                                  parent_outside_routing=None,
+                                  parent_loc=None):
+    # parent_loc maps PRISTINE deployment indices (the numbering of n_list) to
+    # the parent's LOCAL column order (the columns of H / the indices of
+    # parent_outside_routing). None => identity (level-0 parents are never
+    # pruned). A pristine index the parent dropped has no entry: no flow to
+    # conserve and no outside routing can point at it.
     num_local = len(n_list)
     flow_rhs = [0.0] * num_local
     outside_routing = [0.0] * num_local
@@ -70,6 +76,8 @@ def _stochastic_selection_targets(H, current_node, n_list, parent_cloud,
         return flow_rhs, outside_routing, True, 0.0
     providers = parent_cloud["providers"]
     ncols = H.shape[1]
+    if parent_loc is None:
+        parent_loc = {n: n for n in range(ncols)}
 
     def is_physical(j):
         p = providers[f"provider_{j}"]
@@ -90,8 +98,9 @@ def _stochastic_selection_targets(H, current_node, n_list, parent_cloud,
         rep = leaf_pos[current_node]
         lam_rep = own_rate(current_node)
         for l, n in enumerate(n_list):
-            if 0 <= rep < H.shape[0] and 0 <= n < ncols:
-                flow_rhs[l] = lam_rep * float(H[rep][n])
+            c = parent_loc.get(n)
+            if c is not None and 0 <= rep < H.shape[0]:
+                flow_rhs[l] = lam_rep * float(H[rep][c])
 
     others = [j for j in parent_leaves if j != current_node]
     if parent_outside_routing is None:
@@ -105,12 +114,13 @@ def _stochastic_selection_targets(H, current_node, n_list, parent_cloud,
     tot = sum(own_rate(j) for j in others) + float(parent_outside_rate)
     if tot > 0:
         for l, n in enumerate(n_list):
-            if 0 <= n < ncols:
-                own_part = sum(own_rate(j) * float(H[leaf_pos[j]][n]) for j in others
-                               if leaf_pos[j] < H.shape[0])
-                parent_part = (float(parent_outside_rate) * float(parent_outside_routing[n])
-                               if n < len(parent_outside_routing) else 0.0)
-                outside_routing[l] = (own_part + parent_part) / tot
+            c = parent_loc.get(n)
+            if c is None:
+                continue
+            own_part = sum(own_rate(j) * float(H[leaf_pos[j]][c]) for j in others
+                           if leaf_pos[j] < H.shape[0])
+            parent_part = float(parent_outside_rate) * float(parent_outside_routing[c])
+            outside_routing[l] = (own_part + parent_part) / tot
     return flow_rhs, outside_routing, head_has_own, tot
 
 
@@ -122,7 +132,36 @@ def update_requirements_config(requirements_workflow_config, P,H, current_node,c
     selection_list=[]
     if len(P) == 0:
         num_workflows = 0
+        # Fully pruned region (nothing of this workflow lives here): normalize
+        # to the same consistent "nothing kept" state a partially pruned region
+        # ends up with, so solve_opt builds a trivially feasible empty model
+        # (instead of inheriting the pristine selection_list == {} and adding
+        # an unsatisfiable 0 == 1 selection constraint) and the whole subtree
+        # below inherits emptiness cleanly.
+        requirements_workflow_config["active_workflow_list"] = []
+        for m in range(num_functions):
+            requirements_workflow_config["functions"][f"function_{m}"]["function_set"] = []
+        if stochastic_selection:
+            requirements_workflow_config["flow_rhs"] = []
+            requirements_workflow_config["outside_routing"] = []
+            requirements_workflow_config["outside_rate"] = 0.0
+            requirements_workflow_config["head_has_own"] = False
+            requirements_workflow_config["selection_list"] = {}
+        else:
+            requirements_workflow_config["selection_list"] = []
     else:
+        # The parent's P and H are written in the parent's LOCAL (possibly
+        # reduced) deployment order, while this config -- a pristine copy --
+        # numbers deployments in the original order. The parent's
+        # active_workflow_list maps local position -> pristine index; invert it
+        # to index the parent's arrays. Level-0 parents are never updated (no
+        # active_workflow_list key) => identity.
+        parent_awl = None
+        if parent_workflow_config is not None:
+            parent_awl = parent_workflow_config.get("active_workflow_list")
+        if parent_awl is None:
+            parent_awl = list(range(H.shape[1] if getattr(H, "ndim", 0) == 2 else 0))
+        loc = {int(pn): j for j, pn in enumerate(parent_awl)}
         # The parent's own outside stream (levels >= 2): folded into this
         # region's outside stream so the inside:outside weighting stays exact
         # at every level. Indexed in the parent's local deployment order.
@@ -139,10 +178,15 @@ def update_requirements_config(requirements_workflow_config, P,H, current_node,c
         # elsewhere (they then become virtual placements via function_set below).
         num_orig = num_workflows
         for n in range(num_orig):
-            has_func_here = not all(P[n * num_functions:(n + 1) * num_functions, current_node] == 0)
-            selected = (H.shape[0] > 0 and sum(H[:, n]) > 0)
-            outside_routed = (p_orouting is not None and n < len(p_orouting)
-                              and p_orate * p_orouting[n] > 0)
+            j = loc.get(n)
+            if j is None:
+                # Dropped by the parent: no functions can live here, no parent
+                # leaf can select it, no outside stream can route to it.
+                num_workflows -= 1
+                continue
+            has_func_here = not all(P[j * num_functions:(j + 1) * num_functions, current_node] == 0)
+            selected = (H.shape[0] > 0 and sum(H[:, j]) > 0)
+            outside_routed = (p_orouting is not None and p_orate * p_orouting[j] > 0)
             if has_func_here or (stochastic_selection and (selected or outside_routed)):
                 n_list.append(n)
             else:
@@ -155,7 +199,8 @@ def update_requirements_config(requirements_workflow_config, P,H, current_node,c
             # the local (n_list) deployment order.
             flow_rhs, outside_routing, head_has_own, outside_rate = _stochastic_selection_targets(
                 H, current_node, n_list, parent_cloud_config,
-                parent_outside_rate=p_orate, parent_outside_routing=p_orouting)
+                parent_outside_rate=p_orate, parent_outside_routing=p_orouting,
+                parent_loc=loc)
             requirements_workflow_config["flow_rhs"] = flow_rhs
             requirements_workflow_config["outside_routing"] = outside_routing
             requirements_workflow_config["head_has_own"] = bool(head_has_own)
@@ -164,8 +209,10 @@ def update_requirements_config(requirements_workflow_config, P,H, current_node,c
         else:
             # Deterministic: deployments selected by at least one upper-level leaf
             # stay selected for all users of this region (regional coupling).
+            # H columns are in the parent's local order (n_list holds pristine
+            # indices, all of which the parent kept -- see loc filter above).
             for n in range(num_workflows):
-                if sum(H[:,n_list[n]])>0:
+                if sum(H[:, loc[n_list[n]]]) > 0:
                     selection_list.append(n)
             requirements_workflow_config["selection_list"]=selection_list
         requirements_workflow_config["active_workflow_list"]=n_list
@@ -175,7 +222,7 @@ def update_requirements_config(requirements_workflow_config, P,H, current_node,c
         for m in range(num_functions):
             liste = []
             for n in range(num_workflows):
-                num = n_list[n]
+                num = loc[n_list[n]]
                 if P[num * num_functions + m, current_node] == 0:
                     liste.append(n)
             requirements_workflow_config["functions"][f"function_{m}"]["function_set"] = liste

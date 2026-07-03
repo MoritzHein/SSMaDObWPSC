@@ -147,15 +147,17 @@ if __name__ == "__main__":
                     parent_cloud_path = os.path.join(f"cloud/run_{num_run}", f"requirements_cloud_{k-1}_{curr_node}.json")
                     with open(parent_cloud_path, "r") as f:
                         parent_cloud_config = json.load(f)
-                    # Parent's workflow config: carries the parent's own outside
-                    # stream (outside_rate / outside_routing), which is folded
-                    # recursively into this region's outside stream (levels >= 2).
+                    # Parent's workflow config: carries the parent's
+                    # active_workflow_list (local -> pristine deployment map,
+                    # needed to index the parent's pruned P/H correctly) and,
+                    # in stochastic mode, the parent's own outside stream
+                    # (outside_rate / outside_routing, folded recursively into
+                    # this region's outside stream at levels >= 2).
                     parent_workflow_config = None
-                    if stochastic_selection:
-                        path_parent_workflow = os.path.join(f"workflows/run_{num_run}", workflow_name + "_" + str(predecessor_list[k][s]) + ".json")
-                        if os.path.exists(path_parent_workflow):
-                            with open(path_parent_workflow, "r") as f:
-                                parent_workflow_config = json.load(f)
+                    path_parent_workflow = os.path.join(f"workflows/run_{num_run}", workflow_name + "_" + str(predecessor_list[k][s]) + ".json")
+                    if os.path.exists(path_parent_workflow):
+                        with open(path_parent_workflow, "r") as f:
+                            parent_workflow_config = json.load(f)
                     if requirements_cloud_config["providers"]["provider_0"]["name"]=="tinyfaas":
                         curr_leave_k+=1
                     requirements_workflow_config=update_requirements_config(requirements_workflow_config,np.array(solution['P']),np.array(solution['H']),ind,curr_leave_k,requirements_cloud_config["num_nodes"],seed=seed,parent_cloud_config=parent_cloud_config,stochastic_selection=stochastic_selection,parent_workflow_config=parent_workflow_config)#P_list[predecessor_list[k][s]]
