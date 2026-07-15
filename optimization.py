@@ -324,7 +324,7 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
                     for m in m_start:
                         obj=obj+lam[k]*H[k,n]*( P[n*num_functions+m,i]*w_1*D_in[i]+w_2*L[leave_nodes[k],i]*P[n*num_functions+m,i])# P[n*num_functions+m,i]*w_1*D_in[i]
                     for m in m_end:
-                        obj= obj+lam[k]*H[k,n]*(w_1*D[m,i,k]*P[n*num_functions+m, i]+w_2*L[leave_nodes[k], i] * P[n*num_functions+m, i])
+                        obj= obj+lam[k]*H[k,n]*(w_1*D[m,i,leave_nodes[k]]*P[n*num_functions+m, i]+w_2*L[leave_nodes[k], i] * P[n*num_functions+m, i])
             # Fixed virtual/outside demand: enters and exits through the head
             # node 0 (all outside communication is routed through it).
             if stochastic_decomp:
@@ -342,8 +342,8 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         # through the same function instance (reduces blocking/waiting time).
         for n in range(num_workflows):
             for m in range(num_functions):
-                virt_u = (virtual_rate*outside_routing[n])*quicksum(P[n*num_functions,i]*Time[m]*Speed[m][i] for i in range(num_nodes)) if stochastic_decomp else 0
-                model.addConstr(p[n*num_functions+m]==quicksum(quicksum(lam[k]*H[k,n]*P[n*num_functions,i]*Time[m]*Speed[m][i] for k in range(num_leaves)) for i in range(num_nodes))+virt_u)
+                virt_u = (virtual_rate*outside_routing[n])*quicksum(P[n*num_functions+m,i]*Time[m]*Speed[m][i] for i in range(num_nodes)) if stochastic_decomp else 0
+                model.addConstr(p[n*num_functions+m]==quicksum(quicksum(lam[k]*H[k,n]*P[n*num_functions+m,i]*Time[m]*Speed[m][i] for k in range(num_leaves)) for i in range(num_nodes))+virt_u)
                 obj+=w_3*p[n*num_functions+m]**2
         # Node utilization M_i (share of RAM_max,i expected to be occupied,
         # on top of the utilization left by previously placed workflows).
