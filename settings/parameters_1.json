@@ -1,7 +1,7 @@
 {
     "num_levels": 2,
     "num_workflows": 10,
-    "seed": 43,
+    "seed": 42,
     "w_1": 0.5,
     "w_2": 0.5,
     "w_3": 5,
@@ -36,7 +36,7 @@
     },
     "num_tiny_first": 2,
     "comparison": true,
-    "heuristic": false,
+    "heuristic": true,
     "stochastic_selection": false,
     "comparison_gap": 0.0,
     "own_gap": 0.0,

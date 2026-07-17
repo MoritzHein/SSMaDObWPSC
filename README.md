@@ -123,3 +123,28 @@ study, and a regression-based estimate of the individual effects to
 `results/run_N/`. Each figure covers both the decomposed and the comparison
 solution, and the titles state whether the comparison is the centralized
 optimization or the heuristic (read from `settings/parameters_N.json`).
+
+## Changelog / reproducibility notes
+
+**2026-07 — objective index fixes in `solve_opt` (optimization.py).** Two
+indexing errors in the objective were fixed: (1) the quadratic function-
+utilization penalty used function 0's placement row for every function of a
+deployment (now `P[n*num_functions+m, i]`, matching the documented
+u_{n,m} formula); (2) the money cost of returning the result to the user
+indexed the data-transfer tensor `D` with the leaf *counter* instead of the
+leaf's node id (now `D[m, i, leave_nodes[k]]`; only full/centralized and
+top-level subproblems were affected). Placements solved after these fixes are
+NOT bit-comparable with runs produced before them; regenerate baselines and
+`--adapt` sweeps before comparing against new results.
+
+**2026-07-16 — cached JSON reads in `selection_simulation.py`.** The cost
+loops re-read the same placement/cloud/workflow files once per request,
+function and hierarchy level (millions of `open()` calls on multi-level runs
+— prohibitively slow on network drives). Input files are now served from an
+in-process cache (`load_json_cached`). Correctness: every access re-validates
+the entry against the file's `(st_mtime_ns, st_size, st_ino)`, and — because
+the Windows file-time clock ticks coarsely — a matching stamp is only trusted
+once the file's mtime is older than a 5 s grace window; younger or changed
+files are always re-parsed. Verified bit-identical `results.json` and
+`detailed_simulation_run_N.json` on run 135 (baseline and scenario sweep
+point); JSON opens dropped from 18,054 to 85 there.

@@ -1,7 +1,21 @@
 # Visualization of the sensitivity study.
 #
-# Usage: visualization_sensitivity.py --num_run=<N>
+# Usage: visualization_sensitivity.py --num_run=<N> [--params=<p1,p2,...>]
 #        (figures are saved to results/run_<N>/)
+#
+# --params (alias --param) restricts the per-parameter figures (tornado,
+# response curves, adaptation offset, regression bars) to a comma-separated
+# subset of request_rate,time,speedup,latency,ram. Subset figures are saved
+# with the selected parameters as a filename suffix so the full-study figures
+# are not overwritten; the regression is still FITTED on all factor columns
+# (only the displayed bars are filtered), so regression_summary.json is
+# unaffected by the selection.
+#
+# --comparison=False drops the comparison solution from every figure: the
+# two-column figures collapse to a single decomposed panel (and the
+# distribution/regression show only the decomposed series). Figures are then
+# saved with a "_decomposed" filename suffix so the full figures are kept.
+# Default: --comparison=True (unchanged behavior).
 #
 # Produces, when the corresponding data is present:
 #   - sensitivity_tornado          : per-parameter overall_cost range from the
@@ -99,11 +113,11 @@ def style(p):
     return PARAM_STYLE.get(p, ("C7", "x"))
 
 
-def save(fig, export_path, name):
+def save(fig, export_path, name, suffix=""):
     for ext in ("pdf", "png"):
-        fig.savefig(os.path.join(export_path, f"{name}.{ext}"), bbox_inches="tight")
+        fig.savefig(os.path.join(export_path, f"{name}{suffix}.{ext}"), bbox_inches="tight")
     plt.close(fig)
-    print(f"  saved {name}.pdf / .png")
+    print(f"  saved {name}{suffix}.pdf / .png")
 
 
 def _finite(values):
@@ -111,11 +125,12 @@ def _finite(values):
 
 
 # ---------------------------------------------------------------- tornado
-def plot_tornado(sweep, export_path, targets):
+def plot_tornado(sweep, export_path, targets, suffix=""):
     params = list(sweep.get("params", {}).keys())
     if not params:
         return
-    fig, axes = plt.subplots(1, 2, figsize=(9, 0.6 * len(params) + 2))
+    fig, axes = plt.subplots(1, len(targets),
+                             figsize=(4.5 * len(targets), 0.6 * len(params) + 2))
     for ax, (target, title) in zip(np.atleast_1d(axes), targets):
         base = sweep.get("baseline", {}).get(target)
         rows = []
@@ -141,16 +156,17 @@ def plot_tornado(sweep, export_path, targets):
         ax.set_title(title)
         ax.legend(loc="best", fontsize=8)
     fig.suptitle("Effect of individual uncertainties (scale sweep)")
-    save(fig, export_path, "sensitivity_tornado")
+    save(fig, export_path, "sensitivity_tornado", suffix)
 
 
 # -------------------------------------------------------- response curves
-def plot_response_curves(sweep, export_path, targets):
+def plot_response_curves(sweep, export_path, targets, suffix=""):
     params = list(sweep.get("params", {}).keys())
     if not params:
         return
     any_adapted = False
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.5), sharex=True,sharey=True)
+    fig, axes = plt.subplots(1, len(targets), figsize=(4.5 * len(targets), 3.5),
+                             sharex=True, sharey=True)
     for ax, (target, title) in zip(np.atleast_1d(axes), targets):
         base = sweep.get("baseline", {}).get(target)
         for p in params:
@@ -185,11 +201,11 @@ def plot_response_curves(sweep, export_path, targets):
         names = names + ["nominal placement", "adapted placement"]
     np.atleast_1d(axes)[0].legend(handles, names, loc="best", fontsize=8)
     fig.suptitle("Cost response to each uncertainty")
-    save(fig, export_path, "sensitivity_response_curves")
+    save(fig, export_path, "sensitivity_response_curves", suffix)
 
 
 # ------------------------------------------------------- adaptation offset
-def plot_adaptation_offset(sweep, export_path, targets):
+def plot_adaptation_offset(sweep, export_path, targets, suffix=""):
     """Offset of the fixed nominal placement to the adapted re-planning
     baseline (run_scale_sweep.py --adapt), per parameter and scale factor.
     Top row: absolute offset, bottom row: relative offset. Positive = keeping
@@ -234,18 +250,22 @@ def plot_adaptation_offset(sweep, export_path, targets):
     axes[1][0].set_ylabel(r"$(C_\mathrm{nom} - C_\mathrm{ad})\,/\,C_\mathrm{ad}$ [%]")
     axes[0][0].legend(loc="best", fontsize=8)
     fig.suptitle("Regret of keeping the nominal placement vs. re-planning")
-    save(fig, export_path, "sensitivity_adaptation_offset")
+    save(fig, export_path, "sensitivity_adaptation_offset", suffix)
 
 
 # ----------------------------------------------------------- distribution
-def plot_distribution(summary, export_path, targets):
+def plot_distribution(summary, export_path, targets, suffix=""):
     scenarios = summary.get("scenarios", [])
+    name_dec = targets[0][1]
+    # With --comparison=False the targets carry only the decomposed solution;
+    # drop the comparison series entirely.
+    name_comp = targets[1][1] if len(targets) > 1 else None
     oc = _finite([r.get("overall_cost") for r in scenarios])
-    occ = _finite([r.get("overall_cost_comparison") for r in scenarios])
+    occ = (_finite([r.get("overall_cost_comparison") for r in scenarios])
+           if name_comp else [])
     if not oc and not occ:
         return
     base = summary.get("baseline", {})
-    name_dec, name_comp = targets[0][1], targets[1][1]
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 3.5))
 
     data, labels, bases = [], [], []
@@ -269,14 +289,14 @@ def plot_distribution(summary, export_path, targets):
         ax2.hist(occ, bins=min(20, max(5, len(occ) // 2)), alpha=0.6, label=name_comp)
     if base.get("overall_cost") is not None:
         ax2.axvline(base["overall_cost"], color="C0", linestyle="--", linewidth=1)
-    if base.get("overall_cost_comparison") is not None:
+    if name_comp and base.get("overall_cost_comparison") is not None:
         ax2.axvline(base["overall_cost_comparison"], color="C1", linestyle="--", linewidth=1)
     ax2.set_xlabel(r"Overall cost $C$")
     ax2.set_ylabel("count")
     ax2.legend(fontsize=8)
     ax2.set_title("Distribution")
     fig.suptitle("Sensitivity distribution (combined study)")
-    save(fig, export_path, "sensitivity_distribution")
+    save(fig, export_path, "sensitivity_distribution", suffix)
 
 
 # ------------------------------------------------------------- regression
@@ -319,7 +339,7 @@ def _standardized_regression(rows, target, param_cols):
     return coef, r2, dropped
 
 
-def plot_regression(csv_rows, export_path, targets):
+def plot_regression(csv_rows, export_path, targets, selected=None, suffix=""):
     if not csv_rows:
         return
     param_cols = [c for c in csv_rows[0].keys() if c.endswith("_factor_mean")]
@@ -332,10 +352,19 @@ def plot_regression(csv_rows, export_path, targets):
         out[name] = {"coefficients": coef, "r2": r2, "dropped_constant": dropped}
 
     params = sorted({p for v in out.values() for p in v["coefficients"]})
+    # --params only filters the DISPLAYED bars; the fit above always uses all
+    # factor columns so the coefficients (and regression_summary.json) do not
+    # change with the selection.
+    if selected is not None:
+        params = [p for p in params if p in selected]
     if not params:
-        print("  regression: all factor columns constant (use per_element=false "
-              "in the combined study for a meaningful estimate); skipped figure")
-        with open(os.path.join(export_path, "regression_summary.json"), "w") as f:
+        if selected is not None and any(v["coefficients"] for v in out.values()):
+            print("  regression: none of the selected --params has a fitted "
+                  "coefficient; skipped figure")
+        else:
+            print("  regression: all factor columns constant (use per_element=false "
+                  "in the combined study for a meaningful estimate); skipped figure")
+        with open(os.path.join(export_path, f"regression_summary{suffix}.json"), "w") as f:
             json.dump(out, f, indent=4)
         return
 
@@ -347,23 +376,47 @@ def plot_regression(csv_rows, export_path, targets):
         vals = [coef.get(p, 0.0) for p in params]
         r2 = out[name]["r2"]
         lbl = f"{name}" + (f" ($R^2$={r2:.2f})" if r2 is not None else "")
-        ax.bar(xpos + (i - 0.5) * width, vals, width, label=lbl)
+        # Center the group of bars for any number of targets (2 -> +-width/2,
+        # 1 -> centered on the tick).
+        ax.bar(xpos + (i - (len(targets) - 1) / 2) * width, vals, width, label=lbl)
     ax.axhline(0, color="k", linewidth=0.8)
     ax.set_xticks(xpos)
     ax.set_xticklabels([label(p) for p in params])
     ax.set_ylabel("standardized regression coef.")
     ax.set_title("Estimated individual effects (combined study regression)")
     ax.legend(fontsize=8)
-    save(fig, export_path, "sensitivity_regression")
+    save(fig, export_path, "sensitivity_regression", suffix)
 
-    with open(os.path.join(export_path, "regression_summary.json"), "w") as f:
+    with open(os.path.join(export_path, f"regression_summary{suffix}.json"), "w") as f:
         json.dump(out, f, indent=4)
-    print("  saved regression_summary.json")
+    print(f"  saved regression_summary{suffix}.json")
+
+
+def _str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("true", "1", "yes", "y"):
+        return True
+    if v.lower() in ("false", "0", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected True/False, got {v!r}")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_run", required=False, type=int, default=None)
+    parser.add_argument("--params", "--param", dest="params", required=False,
+                        type=str, default=None,
+                        help="Comma-separated subset of parameters to plot "
+                             f"(default: all). Choose from {','.join(PARAM_LABELS)}. "
+                             "Subset figures get the selection as a filename "
+                             "suffix so the full figures are kept.")
+    parser.add_argument("--comparison", required=False, type=_str2bool,
+                        default=True,
+                        help="Also plot the comparison solution (default: True). "
+                             "--comparison=False collapses every figure to the "
+                             "decomposed solution only; those figures get a "
+                             "'_decomposed' filename suffix.")
     args = parser.parse_args()
     num_run = args.num_run
     if num_run is None:
@@ -387,25 +440,54 @@ def main():
     else:
         comp_label = "heuristic" if settings.get("heuristic") else "centralized"
     targets = make_targets(comp_label)
+    if not args.comparison:
+        targets = targets[:1]
+
+    # Optional parameter selection: restrict the per-parameter figures to a
+    # subset. Validated against the known parameter keys; subset figures are
+    # saved with the selection as a filename suffix so a later full run does
+    # not have to regenerate anything.
+    selected = None
+    suffix = ""
+    if args.params:
+        selected = [p.strip() for p in args.params.split(",") if p.strip()]
+        unknown = [p for p in selected if p not in PARAM_LABELS]
+        if unknown:
+            raise SystemExit(f"Unknown parameter(s) {unknown}. "
+                             f"Choose from {list(PARAM_LABELS)}.")
+        if set(selected) != set(PARAM_LABELS):
+            suffix = "_" + "_".join(selected)
+    if not args.comparison:
+        suffix += "_decomposed"
 
     sweep = load_json(os.path.join(sens_dir, "scale_sweep_summary.json"))
     summary = load_json(os.path.join(sens_dir, "summary.json"))
     csv_rows = load_csv(os.path.join(sens_dir, "summary.csv"))
 
-    print(f"Saving figures to {export_path} (comparison = {comp_label})")
+    if sweep and selected is not None:
+        missing = [p for p in selected if p not in sweep.get("params", {})]
+        if missing:
+            print(f"  note: {missing} not in the scale-sweep data; plotting the rest")
+        sweep["params"] = {p: v for p, v in sweep.get("params", {}).items()
+                           if p in selected}
+
+    print(f"Saving figures to {export_path} "
+          f"(comparison = {comp_label if args.comparison else 'off'}"
+          + (f", params = {','.join(selected)}" if selected is not None else "") + ")")
     if sweep:
-        plot_tornado(sweep, export_path, targets)
-        plot_response_curves(sweep, export_path, targets)
-        plot_adaptation_offset(sweep, export_path, targets)
+        plot_tornado(sweep, export_path, targets, suffix)
+        plot_response_curves(sweep, export_path, targets, suffix)
+        plot_adaptation_offset(sweep, export_path, targets, suffix)
     else:
         print("  no scale_sweep_summary.json (run run_scale_sweep.py) -> "
               "skipping tornado + response curves + adaptation offset")
     if summary:
-        plot_distribution(summary, export_path, targets)
+        plot_distribution(summary, export_path, targets,
+                          "" if args.comparison else "_decomposed")
     else:
         print("  no summary.json (run run_sensitivity.py) -> skipping distribution")
     if csv_rows:
-        plot_regression(csv_rows, export_path, targets)
+        plot_regression(csv_rows, export_path, targets, selected, suffix)
     else:
         print("  no summary.csv -> skipping regression")
 

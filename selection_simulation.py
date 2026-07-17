@@ -21,6 +21,39 @@ import json
 import numpy as np
 import argparse
 import os
+
+# Cached JSON reader for the simulation's input files. The cost loops re-read
+# the same placement/cloud/workflow files thousands of times (per request,
+# function and hierarchy level), which is prohibitively expensive on network
+# drives. Every access re-validates the cache entry against the file's
+# (st_mtime_ns, st_size, st_ino), so a file that changes on disk between two
+# reads is re-parsed - only genuinely unchanged files are served from memory.
+# Windows caveat: the file-time clock ticks coarsely (~16 ms), so a same-size
+# rewrite within the same tick would keep an identical stamp. Therefore a
+# matching stamp is only trusted once the file's mtime is at least
+# _JSON_CACHE_GRACE_S old; younger files are re-read on every access. Files
+# in this pipeline are written once per run stage and only read afterwards,
+# so past the grace window an unchanged stamp implies unchanged content.
+# Callers must treat the returned object as read-only; the two sites that edit
+# the branch matrix `b` copy it first.
+from time import time as _wall_clock
+_JSON_CACHE = {}
+_JSON_CACHE_GRACE_S = 5.0
+
+
+def load_json_cached(path):
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+        hit = _JSON_CACHE.get(path)
+        if (hit is not None and hit[0] == stamp
+                        and _wall_clock() - st.st_mtime_ns / 1e9 > _JSON_CACHE_GRACE_S):
+                return hit[1]
+        with open(path, "r") as f:
+                data = json.load(f)
+        _JSON_CACHE[path] = (stamp, data)
+        return data
+
+
 if __name__ == "__main__":
 
 
@@ -53,16 +86,14 @@ if __name__ == "__main__":
 
         placement_path=f"placement/run_{num_run}"
         parameter_config_path=f"settings/parameters_{num_run}.json"
-        with open(parameter_config_path, "r") as f:
-                parameter_general_config = json.load(f)
+        parameter_general_config = load_json_cached(parameter_config_path)
         provider_cost_list=parameter_general_config["provider_cost_list"]
         # Stage 1 stochastic selection: when on, the comparison/centralized
         # evaluation samples each request's deployment from the continuous policy
         # H[leaf,:] and reports a Monte-Carlo cost. Absent => off => unchanged.
         stochastic_selection=parameter_general_config.get("stochastic_selection", False)
         general_config_path=f"cloud/run_{num_run}/general_config.json"
-        with open(general_config_path, "r") as f:
-                cloud_general_config = json.load(f)
+        cloud_general_config = load_json_cached(general_config_path)
         num_leaves=cloud_general_config["num_leaves"]
         num_workflows= parameter_general_config["num_workflows"]
         num_levels=parameter_general_config["num_levels"]
@@ -114,8 +145,7 @@ if __name__ == "__main__":
                         pred_k_list.append(pred_k)
 
                         placement_path = in_path("placement", f"opt_{t}_{pred_k+ind_start_list[r]}.json")
-                        with open(placement_path, "r") as f:
-                                curr_placement = json.load(f)
+                        curr_placement = load_json_cached(placement_path)
                         L=curr_placement["L"]
 
                         lat_upward=L[0][pos]
@@ -170,8 +200,7 @@ if __name__ == "__main__":
         for t in range(num_workflows):
                 cloud_name = f"requirements_cloud_full.json"
                 path_cloud = in_path("cloud", cloud_name)
-                with open(path_cloud, "r") as f:
-                        cloud_config = json.load(f)
+                cloud_config = load_json_cached(path_cloud)
                 for k in range(num_leaves):
                         request_rates[t, k] = cloud_config["providers"][f"provider_{k + num_other}"]["request_rate"]
         requests = np.zeros((sim_time, num_workflows, num_leaves))
@@ -179,8 +208,7 @@ if __name__ == "__main__":
         # RAM capacity per physical node: only edge (tinyfaas) nodes are
         # limited; cloud nodes never block due to RAM.
         cloud_full_path = in_path("cloud", "requirements_cloud_full.json")
-        with open(cloud_full_path, 'r') as f:
-                cloud_full = json.load(f)
+        cloud_full = load_json_cached(cloud_full_path)
         num_nodes_global = cloud_full.get('num_nodes', 0)
         node_ram_max = [cloud_full['providers'][f'provider_{i}'].get('max_RAM_curr', 1e9) if cloud_full['providers'][f'provider_{i}'].get('name')=="tinyfaas" else np.inf for i in
                         range(num_nodes_global)]
@@ -200,8 +228,7 @@ if __name__ == "__main__":
 
                 wf_path = in_path("workflows", f"requirements_workflow_{w}_0.json")
                 try:
-                        with open(wf_path, 'r') as f:
-                                wf_conf = json.load(f)
+                        wf_conf = load_json_cached(wf_path)
                 except Exception:
                         wf_conf = {}
                 deployment_number=wf_conf["deployment_number"]
@@ -219,16 +246,18 @@ if __name__ == "__main__":
                 b_full = []
                 full_path = in_path("placement", f"opt_{w}_full.json")
                 try:
-                        with open(full_path, 'r') as f:
-                                full_place_tmp = json.load(f)
-                                if 'L' in full_place_tmp:
-                                        L_full = full_place_tmp.get('L', [])
-                                a_full = full_place_tmp.get('a', [])
-                                b_full = full_place_tmp.get('b', [])
-                                if len(b_full)>1:
-                                        for r in range(1,len(b_full)):
-                                                b_full[r][0]=0
-                                                b_full[r][-1]=0
+                        full_place_tmp = load_json_cached(full_path)
+                        if 'L' in full_place_tmp:
+                                L_full = full_place_tmp.get('L', [])
+                        a_full = full_place_tmp.get('a', [])
+                        b_full = full_place_tmp.get('b', [])
+                        if len(b_full)>1:
+                                # Copy before zeroing: the loaded object is shared
+                                # via the cache and must stay unmodified.
+                                b_full = [list(row) for row in b_full]
+                                for r in range(1,len(b_full)):
+                                        b_full[r][0]=0
+                                        b_full[r][-1]=0
                 except Exception:
                         pass
                 # Latency now lives in the cloud config; the opt_<w>_full.json L
@@ -239,8 +268,7 @@ if __name__ == "__main__":
 
                 top_path = in_path("placement", f"opt_{w}_0.json")
                 try:
-                        with open(top_path, 'r') as f:
-                                top_place = json.load(f)
+                        top_place = load_json_cached(top_path)
                 except Exception:
                         top_place = {}
 
@@ -250,16 +278,11 @@ if __name__ == "__main__":
                 # own last-level subproblem H and mapped back to original
                 # deployment indices via the active_workflow_list chain.
                 if stochastic_selection:
-                        _cache = {}
-
                         def _load(path):
-                                if path not in _cache:
-                                        try:
-                                                with open(path, 'r') as f:
-                                                        _cache[path] = json.load(f)
-                                        except Exception:
-                                                _cache[path] = {}
-                                return _cache[path]
+                                try:
+                                        return load_json_cached(path)
+                                except Exception:
+                                        return {}
 
                         def place_deployment(d, m):
                                 # Follow deployment d's function m down its placement
@@ -377,8 +400,7 @@ if __name__ == "__main__":
                                                 opt_num = find_opt(opt_num, prev_selected_place, r)
                                         placement_path = in_path("placement", f"opt_{w}_{opt_num}.json")
                                         try:
-                                                with open(placement_path, 'r') as f:
-                                                        curr_placement = json.load(f)
+                                                curr_placement = load_json_cached(placement_path)
                                         except Exception:
                                                 curr_placement = {}
 
@@ -386,8 +408,7 @@ if __name__ == "__main__":
                                         curr_workflow = {}
                                         try:
                                                 workflow_path = in_path("workflows", f"requirements_workflow_{w}_{opt_num}.json")
-                                                with open(workflow_path, 'r') as f:
-                                                        curr_workflow = json.load(f)
+                                                curr_workflow = load_json_cached(workflow_path)
                                         except Exception:
                                                 curr_workflow = {}
 
@@ -461,10 +482,8 @@ if __name__ == "__main__":
                 sol_path = in_path("placement", f"opt_{w}_full.json")
                 node_path = in_path("cloud", f"requirements_cloud_full.json")
                 try:
-                        with open(wf_path, 'r') as f:
-                                wf_conf = json.load(f)
-                        with open(node_path, 'r') as f:
-                                node_conf = json.load(f)
+                        wf_conf = load_json_cached(wf_path)
+                        node_conf = load_json_cached(node_path)
                 except Exception:
                         wf_conf = {}
                         node_conf = {}
@@ -963,10 +982,8 @@ if __name__ == "__main__":
                 select_cost=0
                 workflow_path=in_path("workflows", f"requirements_workflow_{t}_0.json")
                 placement_path=in_path("placement", f"opt_{t}_0.json")
-                with open(workflow_path, "r") as f:
-                        workflow_config = json.load(f)
-                with open(placement_path, "r") as f:
-                        placement_config = json.load(f)
+                workflow_config = load_json_cached(workflow_path)
+                placement_config = load_json_cached(placement_path)
                 num_functions=workflow_config["num_functions"]
                 H=placement_config['H']
                 T=placement_config['T']
@@ -1030,12 +1047,9 @@ if __name__ == "__main__":
                                                 placement_path=in_path("placement", f"opt_{t}_{opt_num}.json")
                                                 workflow_path = in_path("workflows", f"requirements_workflow_{t}_{opt_num}.json")
                                                 cloud_path = in_path("cloud", f"requirements_cloud_{r}_{opt_num-ind_start_list[r]}.json")
-                                                with open(placement_path, "r") as f:
-                                                        curr_placement = json.load(f)
-                                                with open(cloud_path, "r") as f:
-                                                        curr_cloud = json.load(f)
-                                                with open(workflow_path, "r") as f:
-                                                        curr_workflow = json.load(f)
+                                                curr_placement = load_json_cached(placement_path)
+                                                curr_cloud = load_json_cached(cloud_path)
+                                                curr_workflow = load_json_cached(workflow_path)
 
                                                 curr_P=curr_placement['P']
                                                 # Region latency from the (perturbable) cloud config;
@@ -1103,8 +1117,7 @@ if __name__ == "__main__":
                                                         # own head node plus the user's upward latency).
                                                         if pred_k_list[r]==opt_num-ind_start_list[r]:
 
-                                                                with open(placement_path, "r") as f:
-                                                                        curr_placement = json.load(f)
+                                                                curr_placement = load_json_cached(placement_path)
 
 
                                                                 curr_L = curr_cloud.get('L', curr_placement['L'])
@@ -1149,14 +1162,12 @@ if __name__ == "__main__":
                                         if pred_k_list[r] == pred_k_list_new[r]:
                                                 opt_num=pred_k_list[r]+ind_start_list[r]
                                                 placement_path = in_path("placement", f"opt_{t}_{opt_num}.json")
-                                                with open(placement_path, "r") as f:
-                                                        curr_placement = json.load(f)
+                                                curr_placement = load_json_cached(placement_path)
                                                 # Region latency from the (perturbable) cloud config
                                                 # (opt_num - ind_start_list[r] == pred_k_list[r]);
                                                 # opt-file L kept only as a legacy fallback.
                                                 cloud_path = in_path("cloud", f"requirements_cloud_{r}_{pred_k_list[r]}.json")
-                                                with open(cloud_path, "r") as f:
-                                                        curr_cloud = json.load(f)
+                                                curr_cloud = load_json_cached(cloud_path)
                                                 curr_L = curr_cloud.get('L', curr_placement['L'])
                                                 L_end += curr_L[pos_list[r]][pos_list_new[r]]
                                         else:
@@ -1216,14 +1227,12 @@ if __name__ == "__main__":
                 for t in range(num_workflows):
                         cloud_name = f"requirements_cloud_full.json"
                         path_cloud = in_path("cloud", cloud_name)
-                        with open(path_cloud, "r") as f:
-                                cloud_config = json.load(f)
+                        cloud_config = load_json_cached(path_cloud)
                         for k in range(num_leaves):
                                 request_rates[t,k]=cloud_config["providers"][f"provider_{k+num_other}"]["request_rate"]
                 requests=np.zeros((sim_time,num_workflows,num_leaves))
                 cloud_full_path = in_path("cloud", "requirements_cloud_full.json")
-                with open(cloud_full_path, 'r') as f:
-                        cloud_full = json.load(f)
+                cloud_full = load_json_cached(cloud_full_path)
                 num_nodes_global = cloud_full.get('num_nodes', 0)
                 node_ram_max = [cloud_full['providers'][f'provider_{i}'].get('max_RAM_curr', 1e9) if cloud_full['providers'][f'provider_{i}'].get('name')=="tinyfaas" else np.inf for i in
                         range(num_nodes_global)]
@@ -1234,8 +1243,7 @@ if __name__ == "__main__":
 
                         wf_path = in_path("workflows", f"requirements_workflow_{w}_0.json")
                         try:
-                                with open(wf_path, 'r') as f:
-                                        wf_conf = json.load(f)
+                                wf_conf = load_json_cached(wf_path)
                         except Exception:
                                 wf_conf = {}
                         num_funcs = wf_conf.get('num_functions', 0)
@@ -1250,10 +1258,9 @@ if __name__ == "__main__":
                         L_full = []
                         full_path = in_path("placement", f"opt_{w}_full.json")
                         try:
-                                with open(full_path, 'r') as f:
-                                        full_place_tmp = json.load(f)
-                                        if 'L' in full_place_tmp:
-                                                L_full = full_place_tmp.get('L', [])
+                                full_place_tmp = load_json_cached(full_path)
+                                if 'L' in full_place_tmp:
+                                        L_full = full_place_tmp.get('L', [])
                         except Exception:
                                 pass
                         # Prefer the (perturbable) cloud-config L; the opt-file
@@ -1263,8 +1270,7 @@ if __name__ == "__main__":
 
                         top_path = in_path("placement", f"opt_{w}_0.json")
                         try:
-                                with open(top_path, 'r') as f:
-                                        top_place = json.load(f)
+                                top_place = load_json_cached(top_path)
                         except Exception:
                                 top_place = {}
 
@@ -1297,8 +1303,7 @@ if __name__ == "__main__":
                                                         opt_num = find_opt(opt_num, prev_selected_place, r)
                                                 placement_path = in_path("placement", f"opt_{w}_{opt_num}.json")
                                                 try:
-                                                        with open(placement_path, 'r') as f:
-                                                                curr_placement = json.load(f)
+                                                        curr_placement = load_json_cached(placement_path)
                                                 except Exception:
                                                         curr_placement = {}
 
@@ -1306,8 +1311,7 @@ if __name__ == "__main__":
                                                 curr_workflow = {}
                                                 try:
                                                         workflow_path = in_path("workflows", f"requirements_workflow_{w}_{opt_num}.json")
-                                                        with open(workflow_path, 'r') as f:
-                                                                curr_workflow = json.load(f)
+                                                        curr_workflow = load_json_cached(workflow_path)
                                                 except Exception:
                                                         curr_workflow = {}
 
@@ -1365,10 +1369,8 @@ if __name__ == "__main__":
                         sol_path = in_path("placement", f"opt_{w}_full.json")
                         node_path = in_path("cloud", f"requirements_cloud_full.json")
                         try:
-                                with open(wf_path, 'r') as f:
-                                        wf_conf = json.load(f)
-                                with open(node_path, 'r') as f:
-                                        node_conf = json.load(f)
+                                wf_conf = load_json_cached(wf_path)
+                                node_conf = load_json_cached(node_path)
                         except Exception:
                                 wf_conf = {}
                                 node_conf = {}
@@ -1384,8 +1386,7 @@ if __name__ == "__main__":
                                         sol_conf = {}
                         else:
                                 try:
-                                        with open(sol_path, 'r') as f:
-                                                sol_conf = json.load(f)
+                                        sol_conf = load_json_cached(sol_path)
                                 except Exception:
                                         sol_conf = {}
 
@@ -1413,6 +1414,9 @@ if __name__ == "__main__":
                         # Count the shared start/finish functions in only one branch so
                         # they are not executed once per branch in the simulation.
                         if len(b) > 1:
+                                # Copy before zeroing: sol_conf may come from the shared
+                                # JSON cache and must stay unmodified.
+                                b = [list(row) for row in b]
                                 for r in range(1, len(b)):
                                         b[r][0] = 0
                                         b[r][-1] = 0
@@ -1852,12 +1856,9 @@ if __name__ == "__main__":
                         path_workflow = in_path("workflows", f"requirements_workflow_{t}" + "_0.json")
                         path_solution = in_path("placement", sol_name + "_full.json")
 
-                        with open(path_cloud, "r") as f:
-                                cloud_config = json.load(f)
-                        with open(path_workflow, "r") as f:
-                                workflow_config = json.load(f)
-                        with open(path_solution, "r") as f:
-                                placement_config = json.load(f)
+                        cloud_config = load_json_cached(path_cloud)
+                        workflow_config = load_json_cached(path_workflow)
+                        placement_config = load_json_cached(path_solution)
                         num_functions = workflow_config["num_functions"]
                         num_deployment = workflow_config["deployment_number"]
                         num_nodes=cloud_config["num_nodes"]
@@ -1970,6 +1971,21 @@ if __name__ == "__main__":
         overall_cost = w_1 * money_cost_all+w_2 * sum(req_done_list)
         print(overall_cost)
         results['overall_cost_comparison'] = overall_cost[0]
+
+        # Persist the comparison run's cost split in a sibling file (results.json
+        # itself only carries overall_cost_comparison and is consumed by the
+        # visualization scripts, so its content stays unchanged). The comparison
+        # is the centralized solve or the all-on-cloud heuristic depending on
+        # the run's settings; the flag records which one produced these costs.
+        comparison_results = {
+                'heuristic': bool(heuristic),
+                'overall_cost': float(np.ravel(overall_cost)[0]),
+                'money_cost': float(np.ravel(money_cost_all)[0]),
+                'time_cost': float(np.ravel(time_cost_all)[0]),
+                'complete_time_cost': float(sum(sum(waiting_acc))),
+        }
+        with open(os.path.join(results_dir, "results_comparison.json"), "w") as f:
+                json.dump(comparison_results, f, indent=4)
 
 
         # Store the aggregated costs (results.json: used by the visualization

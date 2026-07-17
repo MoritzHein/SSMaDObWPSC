@@ -10,6 +10,7 @@ centralized architecture, depending on the cloud config that is passed in.
 """
 from gurobipy import *
 import numpy as np
+import os
 from typing import Any, Dict
 import time
 
@@ -409,6 +410,16 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
             # it ever fails, demand bookkeeping is broken and the constraint
             # must not be silently dropped.
             if stochastic_decomp and abs(sum(lam) - sum(flow_rhs)) < 1e-6:
+                # Rescale flow_rhs so its sum equals sum(lam) EXACTLY. The
+                # residual FP noise (~1e-8, from the parent's H rows summing to
+                # 1 only within solver tolerance) is otherwise aggregated by
+                # Gurobi's presolve across the simplex + flow equalities into
+                # an exact 0 == eps contradiction, and the subproblem is
+                # declared infeasible even though the noise is far below
+                # FeasibilityTol (run_134, speedup x1.25, opt_0_4).
+                if sum(flow_rhs) > 0:
+                    rhs_scale = sum(lam) / sum(flow_rhs)
+                    flow_rhs = [x * rhs_scale for x in flow_rhs]
                 for n in range(num_workflows):
                     model.addConstr(quicksum(lam[k]*H[k, n] for k in range(num_leaves)) == flow_rhs[n], "flow_conservation")
             elif stochastic_decomp:
@@ -442,6 +453,15 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         #    model.addConstr(quicksum(P[j,num-1] for j in range( num_functions))==0,"node_0_constr")
         model.setParam('OutputFlag', 1)
         model.update()
+        # Diagnostic hook: OPTIFAAS_DEBUG_DUMP=<dir> dumps every model
+        # (overwriting) right before optimize, so after a native solver crash
+        # the last dump is the model that killed the process. No effect when
+        # the variable is unset.
+        dump_dir = os.environ.get("OPTIFAAS_DEBUG_DUMP")
+        if dump_dir:
+            model.setParam("LogFile", os.path.join(dump_dir, "gurobi_last.log"))
+            model.write(os.path.join(dump_dir, "sub_last.mps"))
+            model.write(os.path.join(dump_dir, "sub_last.lp"))
         P_list = []
         # for model in  model_list:
         t1=time.time()
@@ -451,6 +471,17 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
             # model (P, S, H, T, M, p), so the running index r/s walks through
             # each block row-by-row.
             model.optimize()
+            # INF_OR_UNBD (4) is an ambiguous presolve verdict; re-solving with
+            # DualReductions=0 is Gurobi's documented way to force a definite
+            # status. It is also load-bearing: Gurobi 13.0.2 misdeclares some
+            # feasible nonconvex subproblems as 4 (run_134 request_rate x0.75,
+            # workflow 9), and the retry then finds the true optimum. A truly
+            # infeasible model still ends at status 3 and raises below.
+            if model.status == GRB.INF_OR_UNBD:
+                print("Status INF_OR_UNBD -- re-solving with DualReductions=0 "
+                      "for a definite status.")
+                model.setParam('DualReductions', 0)
+                model.optimize()
             # An infeasible/unbounded subproblem means the decomposition's
             # demand/pruning bookkeeping is inconsistent -- never write a
             # degenerate solution for it (that silently corrupts the run).

@@ -37,6 +37,7 @@
     "num_tiny_first": 2,
     "comparison": true,
     "heuristic": true,
+    "stochastic_selection": false,
     "comparison_gap": 0.0,
     "own_gap": 0.0,
     "config_random_workflows": {

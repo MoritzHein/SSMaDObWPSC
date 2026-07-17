@@ -22,6 +22,10 @@
 # are added to the summary as adapted_overall_cost(_comparison). Note the cost:
 # one full placement solve per sweep point (a centralized comparison solve is
 # a full-architecture MIQP each time), and one full run folder of storage.
+#
+# With --resume, sweep points whose results.json already exists are loaded from
+# disk instead of re-solved, so an interrupted sweep (e.g. a solver crash) can
+# be continued without redoing the finished points.
 import argparse
 import json
 import os
@@ -36,7 +40,7 @@ from generate_sensitivity_scenarios import perturb_cloud, perturb_workflows
 # The five uncertain parameters; request_rate/latency live in the cloud files,
 # time/speedup/ram in the workflow files.
 ALL_PARAMS = ["request_rate", "time", "speedup", "latency", "ram"]
-DEFAULT_FACTORS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+DEFAULT_FACTORS = [0.75, 0.875, 1.0, 1.125,  1.25]
 
 
 def load_json(path):
@@ -45,6 +49,13 @@ def load_json(path):
             return json.load(f)
     except Exception:
         return {}
+
+
+def completed_results(path):
+    # A results.json is only written once its producing script finished, so a
+    # loadable file with a real overall_cost marks the sweep point as done.
+    res = load_json(path)
+    return res if res.get("overall_cost") is not None else None
 
 
 def factor_tag(f):
@@ -90,6 +101,10 @@ def main():
                              "parameters adapted to the perturbed values, as a "
                              "re-planning baseline. Stored under "
                              "sensitivity/run_<N>/scale_sweep/<param>/factor_<tag>/adapted/.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip sweep points whose results.json already exists "
+                             "(useful to continue after a crash; solved points are "
+                             "loaded from disk instead of re-solved).")
     args = parser.parse_args()
     num_run = args.num_run
     if num_run is None:
@@ -136,27 +151,38 @@ def main():
             out_dir = os.path.join("sensitivity", f"run_{num_run}", "scale_sweep",
                                     param, f"factor_{factor_tag(f)}")
             os.makedirs(out_dir, exist_ok=True)
-            manifest = {"num_run": num_run, "param": param, "factor": f, "config": sens}
-            # Only the matching family of files is written: perturb_cloud no-ops
-            # for workflow parameters and perturb_workflows no-ops for cloud ones.
-            perturb_cloud(rng, sens, cloud_dir, out_dir, manifest)
-            perturb_workflows(rng, sens, workflow_dir, out_dir, manifest)
-            with open(os.path.join(out_dir, "scenario_manifest.json"), "w") as fh:
-                json.dump(manifest, fh, indent=4)
+            res = (completed_results(os.path.join(out_dir, "results", "results.json"))
+                   if args.resume else None)
+            if res is not None:
+                print(f"  {param} x{f} already solved, skipping")
+            else:
+                manifest = {"num_run": num_run, "param": param, "factor": f, "config": sens}
+                # Only the matching family of files is written: perturb_cloud no-ops
+                # for workflow parameters and perturb_workflows no-ops for cloud ones.
+                perturb_cloud(rng, sens, cloud_dir, out_dir, manifest)
+                perturb_workflows(rng, sens, workflow_dir, out_dir, manifest)
+                with open(os.path.join(out_dir, "scenario_manifest.json"), "w") as fh:
+                    json.dump(manifest, fh, indent=4)
 
-            print(f"  {param} x{f} ...")
-            subprocess.run(
-                [sys.executable, "selection_simulation.py",
-                 f"--num_run={num_run}", f"--scenario_dir={out_dir}"],
-                check=True)
-            res = load_json(os.path.join(out_dir, "results", "results.json"))
+                print(f"  {param} x{f} ...")
+                subprocess.run(
+                    [sys.executable, "selection_simulation.py",
+                     f"--num_run={num_run}", f"--scenario_dir={out_dir}"],
+                    check=True)
+                res = load_json(os.path.join(out_dir, "results", "results.json"))
             per_param["factors"].append(f)
             per_param["overall_cost"].append(res.get("overall_cost"))
             per_param["overall_cost_comparison"].append(res.get("overall_cost_comparison"))
 
             if args.adapt:
-                print(f"  {param} x{f} adapted placement ...")
-                adapted = run_adapted(num_run, param, f, out_dir)
+                adapted = (completed_results(os.path.join(
+                    out_dir, "adapted", "results", f"run_{num_run}", "results.json"))
+                    if args.resume else None)
+                if adapted is not None:
+                    print(f"  {param} x{f} adapted placement already solved, skipping")
+                else:
+                    print(f"  {param} x{f} adapted placement ...")
+                    adapted = run_adapted(num_run, param, f, out_dir)
                 per_param["adapted_overall_cost"].append(adapted.get("overall_cost"))
                 per_param["adapted_overall_cost_comparison"].append(
                     adapted.get("overall_cost_comparison"))
