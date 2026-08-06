@@ -72,6 +72,18 @@ if __name__ == "__main__":
     # centralized (comparison) solve treats H as a continuous routing policy.
     # Absent => False => unchanged deterministic behavior.
     stochastic_selection=parameter_general_config.get("stochastic_selection", False)
+    # RAM capacity model (see ram_capacity_model.md). Both default to the
+    # previous behaviour, so an unchanged parameter file reproduces old runs.
+    #   ram_eligibility   : forbid placing a function on a node whose subtree has
+    #                       no single physical node large enough to host it.
+    #   ram_capacity_norm : "off" (aggregate RAM_max,i, as before) | "l1" | "l2"
+    #                       -- the capacity that normalises M_i, restricted to
+    #                       the nodes that can actually host each function.
+    ram_eligibility=parameter_general_config.get("ram_eligibility", False)
+    ram_capacity_norm=parameter_general_config.get("ram_capacity_norm", "off")
+    if ram_capacity_norm not in ("off", "l1", "l2"):
+        raise SystemExit(f'ram_capacity_norm must be "off", "l1" or "l2" '
+                         f'(got {ram_capacity_norm!r})')
     # Sample the hierarchical serverless architecture: one cloud config file per
     # (level, region) pair plus a general_config.json describing the hierarchy.
     generate_cloud(num_levels,num_run=num_run,provider_name=provider_list,provider_dev=provider_dev,num_tiny_first=num_tiny_first,provider_cost_list=provider_cost_list,config_random_cloud=config_random_cloud,seed=seed)
@@ -166,7 +178,7 @@ if __name__ == "__main__":
                 # Solve the regional placement subproblem (Eq. (1)) with Gurobi
                 # and store all solution matrices and model parameters as JSON
                 # so that selection_simulation.py can re-evaluate the costs.
-                model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M=solve_opt(requirements_workflow_config,requirements_cloud_config,gap=own_gap,w_1=w_1,w_2=w_2,w_3=w_3,provider_name_list=provider_list,provider_cost_list=provider_cost_list,relax_selection=stochastic_selection)
+                model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M=solve_opt(requirements_workflow_config,requirements_cloud_config,gap=own_gap,w_1=w_1,w_2=w_2,w_3=w_3,provider_name_list=provider_list,provider_cost_list=provider_cost_list,relax_selection=stochastic_selection,ram_eligibility=ram_eligibility,ram_capacity_norm=ram_capacity_norm)
                 solution=dict()
                 solution['P']=P.tolist()
                 solution['H']=H.tolist()
@@ -223,7 +235,7 @@ if __name__ == "__main__":
 
             # Stochastic selection applies to the centralized optimization only
             # (the heuristic forces a trivial one-hot H, so it is left untouched).
-            model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M = solve_opt(requirements_workflow_config, requirements_cloud_config,comparison_gap,w_1,w_2,w_3,provider_list,provider_cost_list,heuristic,relax_selection=(stochastic_selection and not heuristic))
+            model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M = solve_opt(requirements_workflow_config, requirements_cloud_config,comparison_gap,w_1,w_2,w_3,provider_list,provider_cost_list,heuristic,relax_selection=(stochastic_selection and not heuristic),ram_eligibility=ram_eligibility,ram_capacity_norm=ram_capacity_norm)
             solution = dict()
             solution['P'] = P.tolist()
             solution['H'] = H.tolist()

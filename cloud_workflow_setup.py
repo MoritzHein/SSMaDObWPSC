@@ -16,8 +16,16 @@ import re
 # Add the utilization M_i caused by the just-placed workflow to the per-node
 # "utilization" field, so the next workflow's placement starts from M_{i,0} > 0.
 def update_cloud_config(requirements_cloud_config, requirements_workflow_config, P,M):
+    # ASSIGNMENT, not "+=": the model already defines
+    #     M[i] = load_i / RAM_max,i + utilization_i        (optimization.py, "Aux cons")
+    # i.e. M[i] IS the new accumulated utilization after this workflow. Adding it
+    # to the old value counted the old value twice and doubled the baseline with
+    # every workflow (0 -> 0.45 -> 1.10 -> 2.30 -> ... -> 73.7 on run_140's node 3),
+    # after which w_3*M^2 dominated the objective and the solver refused to place
+    # any further load on an already-used node. Accumulation across workflows is
+    # intended (see placement.py) - only the double count was wrong.
     for i in range(M.shape[0]):
-        requirements_cloud_config["providers"][f"provider_{i}"]["utilization"]=requirements_cloud_config["providers"][f"provider_{i}"]["utilization"]+M[i][0]
+        requirements_cloud_config["providers"][f"provider_{i}"]["utilization"]=float(M[i][0])
     #num_functions = requirements_workflow_config["num_functions"]
     #for i in range(P.shape[1]):
     #    ram_add = 0
@@ -696,6 +704,62 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
     path_general_config=f"cloud/run_{num_run}/general_config.json"
     with open(path_general_config, "w") as f:
         json.dump(cloud_general_config, f, indent=4)
+    annotate_ram_profiles(cloud_general_config, num_run, num_levels)
+
+
+# Leaf RAM capacity profile of every node in the hierarchy.
+#
+# A node above the last level is a whole REGION: the generator Dirichlet-splits a
+# parent's RAM over its children, so the parent's "max_RAM_curr" is the SUM of its
+# subtree's capacities. A function, however, has to fit on ONE physical node. The
+# sum therefore hides how much capacity is actually reachable for a function of a
+# given size (on run_141 region 2 sums to 265.1 while its largest node is 52.3).
+#
+# This writes, per node, the sorted list of the capacities of the PHYSICAL nodes
+# in its subtree, from which solve_opt derives both
+#   * the largest single hostable node  (max of the profile), and
+#   * the capacity able to host a function of size x  (over entries >= x).
+# At the last level a node's profile is just its own capacity, so everything
+# derived from it reduces exactly to today's RAM_max,i.
+#
+# Only tinyfaas nodes have a finite capacity in the model (see solve_opt), so a
+# subtree containing any non-tinyfaas physical node is unbounded and gets [inf].
+def annotate_ram_profiles(cloud_general_config, num_run, num_levels):
+    ram_list = cloud_general_config["ram_list"]
+    provider_list = cloud_general_config["provider_list"]
+    num_nodes_in_level = cloud_general_config["num_nodes_in_level"]
+    last = num_levels - 1
+
+    # bottom-up: a node's profile is the concatenation of its children's
+    profiles = [None] * num_levels
+    profiles[last] = [[ram_list[last][j]] if provider_list[last][j] == "tinyfaas" else [np.inf]
+                      for j in range(len(ram_list[last]))]
+    for k in range(last - 1, -1, -1):
+        profiles[k] = []
+        for m in range(len(ram_list[k])):
+            start = sum(num_nodes_in_level[k + 1][:m])
+            count = num_nodes_in_level[k + 1][m]
+            merged = []
+            for child in range(start, start + count):
+                merged += profiles[k + 1][child]
+            profiles[k].append(merged)
+
+    # write into every regional cloud config; provider i of
+    # requirements_cloud_{k}_{m}.json is level-k flat index offset+i
+    for k in range(num_levels):
+        num_regions = 1 if k == 0 else sum(num_nodes_in_level[k - 1])
+        for m in range(num_regions):
+            path = os.path.join(f"cloud/run_{num_run}", f"requirements_cloud_{k}_{m}.json")
+            if not os.path.exists(path):
+                continue
+            with open(path, "r") as f:
+                cfg = json.load(f)
+            offset = sum(num_nodes_in_level[k][:m])
+            for i in range(cfg["num_nodes"]):
+                prof = sorted(profiles[k][offset + i], reverse=True)
+                cfg["providers"][f"provider_{i}"]["ram_leaf_profile"] = prof
+            with open(path, "w") as f:
+                json.dump(cfg, f, indent=4)
 
 # Flatten the hierarchy into one architecture containing only the physical
 # (last-level) nodes - the input of the centralized comparison and of the
@@ -734,6 +798,12 @@ def generate_full_cloud(config,num_run,provider_cost_list,num_levels):
         full_config["providers"][f"provider_{k}"]["request_rate"] = request_list[k]
         full_config["providers"][f"provider_{k}"]["speedup"] =  speedup_list[k]
         full_config["providers"][f"provider_{k}"]["utilization"] = 0
+        # Every node of the flattened architecture IS physical, so its leaf
+        # profile is just itself. Consequence: on this architecture the
+        # ram_capacity_norm options all collapse to today's RAM_max,i, i.e. the
+        # centralized/comparison solve is unaffected by them (regression guard).
+        full_config["providers"][f"provider_{k}"]["ram_leaf_profile"] = (
+            [ram_list[k]] if provider_list[k] == "tinyfaas" else [np.inf])
         full_config["providers"][f"provider_{k}"]["pricing_Storage_Transfer"] = provider_cost_list[provider_list[k]]["pricing_Storage_Transfer"]
         full_config["providers"][f"provider_{k}"]["pricing_RAM"] = provider_cost_list[provider_list[k]]["pricing_RAM"]
         full_config["providers"][f"provider_{k}"]["pricing_data_sent"] = provider_cost_list[provider_list[k]]["pricing_data_sent"]

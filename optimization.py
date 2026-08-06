@@ -15,7 +15,7 @@ from typing import Any, Dict
 import time
 
 # %%
-def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, Any], gap=0,w_1=1,w_2=1,w_3=1,provider_name_list=[],provider_cost_list=[],heuristic=False,relax_selection=False):
+def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, Any], gap=0,w_1=1,w_2=1,w_3=1,provider_name_list=[],provider_cost_list=[],heuristic=False,relax_selection=False,ram_eligibility=False,ram_capacity_norm="off"):
     """Solve the placement + selection problem (Eq. (1) of the paper) with Gurobi.
 
     Parameters
@@ -123,6 +123,40 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         if deployment_cloud['providers'][f"provider_{i}"]["name"]=='tinyfaas':
 
             ram_max[i]=deployment_cloud['providers'][f"provider_{i}"]['max_RAM_curr']
+    # ---- RAM capacity model (see ram_capacity_model.md). Above the last level a
+    # "node" is a whole region whose max_RAM_curr is the SUM of its subtree, while
+    # a function must fit on ONE physical node. ram_leaf_profile holds the sorted
+    # capacities of the physical nodes in the subtree (written by
+    # annotate_ram_profiles); at the last level it is [RAM_max,i], so everything
+    # below reduces exactly to the previous model there.
+    ram_profile = []
+    for i in range(num_nodes):
+        prof = deployment_cloud['providers'][f"provider_{i}"].get('ram_leaf_profile')
+        if not prof:
+            prof = [float(ram_max[i][0])]
+        ram_profile.append(sorted((float(c) for c in prof), reverse=True))
+    # Largest single node able to host a function, per node i.
+    ram_max_node = [p[0] if p else 0.0 for p in ram_profile]
+
+    def ram_denominator(i, m):
+        """Capacity used to normalise function m's RAM occupancy on node i.
+
+        "off" keeps the previous aggregate RAM_max,i. "l1" sums the capacities of
+        the subtree nodes that can host a function of size ram[m]; "l2" takes
+        their Euclidean norm, which is the value that makes this node's squared
+        utilisation term equal the smallest total its children can achieve when
+        they later split the load (derivation in ram_capacity_model.md).
+        """
+        if ram_capacity_norm not in ("l1", "l2"):
+            return float(ram_max[i][0])
+        eligible = [c for c in ram_profile[i] if c >= float(ram[m][0])]
+        if not eligible or any(np.isinf(c) for c in eligible):
+            # nothing can host it (eligibility pins P to 0, the term vanishes),
+            # or the subtree is unbounded -> keep the effectively-infinite budget
+            return float(ram_max[i][0])
+        if ram_capacity_norm == "l1":
+            return float(sum(eligible))
+        return float(np.sqrt(sum(c * c for c in eligible)))
     # Request rate lambda_k of every leaf; in subproblems of the decomposition
     # this already aggregates the rates of the underlying region (Eqs. (2)/(7)).
     for k in range(num_leaves):
@@ -314,6 +348,22 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
             for n in func_set:
                 model.addConstr(P[n*num_functions+m,0]==1,"Already placed workflow functions")
                 already_placed[n,m]+=1
+        # RAM eligibility (see ram_capacity_model.md): a function that is larger
+        # than every physical node in node i's subtree can never be hosted there,
+        # whatever the lower levels decide. This is a necessary condition for any
+        # physical realisation, so forbidding it removes no realisable solution -
+        # and it guarantees a child region can always host what its parent sent.
+        # Virtual placements pinned to the head node by function_set are exempt:
+        # they run in another region and their RAM is subtracted again below.
+        if ram_eligibility:
+            for i in range(num_nodes):
+                for m in range(num_functions):
+                    if float(ram[m][0]) <= ram_max_node[i]:
+                        continue
+                    for n in range(num_workflows):
+                        if i == 0 and already_placed[n, m]:
+                            continue
+                        model.addConstr(P[n*num_functions+m, i] == 0, "RAM eligibility")
         # User <-> workflow communication terms: the first function(s) m_start
         # receive the input data d_in from the requesting leaf (cost D_in plus
         # leaf-to-node latency), the last function(s) m_end send the result back
@@ -353,15 +403,24 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         for i in range(num_nodes):
             curr_util=deployment_cloud["providers"][f"provider_{i}"]["utilization"]
 
+            # Speed[m][i]*Time[m] is the ACTUAL execution duration on node i, so
+            # the RAM-seconds a function occupies are Speed*Time*ram. The function
+            # utilization u_{n,m} above already uses Speed*Time; M_i used the bare
+            # Time[m] and therefore overstated the RAM held on cloud nodes by
+            # 1/speedup. Both penalties now measure the same durations.
+            # The capacity that normalises a function's RAM occupancy depends on
+            # the function (ram_denominator), so the division sits INSIDE the sum
+            # over m. With ram_capacity_norm="off" it is the constant RAM_max,i
+            # for every m and this is algebraically the previous expression.
             if i ==0:
-                virt_M = quicksum((virtual_rate*outside_routing[n])*(quicksum(P[n * num_functions + m, i]*Time[m]*ram[m] for m in range(num_functions))-sum([already_placed[n,m]*Time[m]*ram[m] for m in range(num_functions)])) for n in range(num_workflows)) if stochastic_decomp else 0
-                model.addConstr(M[i] == (quicksum(quicksum(lam[k]*H[k,n]*(quicksum(P[n * num_functions + m, i]*Time[m]*ram[m] for m in range(num_functions))-sum([already_placed[n,m]*Time[m]*ram[m] for m in range(num_functions)])) for k in range(num_leaves)) for n in range(num_workflows))+virt_M)/ram_max[i]+curr_util,
+                virt_M = quicksum((virtual_rate*outside_routing[n])*(quicksum(P[n * num_functions + m, i]*Speed[m][i]*Time[m]*ram[m]/ram_denominator(i,m) for m in range(num_functions))-sum([already_placed[n,m]*Speed[m][i]*Time[m]*ram[m]/ram_denominator(i,m) for m in range(num_functions)])) for n in range(num_workflows)) if stochastic_decomp else 0
+                model.addConstr(M[i] == quicksum(quicksum(lam[k]*H[k,n]*(quicksum(P[n * num_functions + m, i]*Speed[m][i]*Time[m]*ram[m]/ram_denominator(i,m) for m in range(num_functions))-sum([already_placed[n,m]*Speed[m][i]*Time[m]*ram[m]/ram_denominator(i,m) for m in range(num_functions)])) for k in range(num_leaves)) for n in range(num_workflows))+virt_M+curr_util,
                                 "Aux cons")
             else:
-                virt_M = quicksum((virtual_rate*outside_routing[n])*quicksum(P[n * num_functions + m, i]*Time[m]*ram[m] for m in range(num_functions)) for n in range(num_workflows)) if stochastic_decomp else 0
-                model.addConstr(M[i] == (quicksum(quicksum(
-                    quicksum(lam[k]*H[k, n] * P[n * num_functions + m, i]*Time[m]*ram[m] for m in range(num_functions)) for k in
-                    range(num_leaves)) for n in range(num_workflows))+virt_M)/ram_max[i]+curr_util,
+                virt_M = quicksum((virtual_rate*outside_routing[n])*quicksum(P[n * num_functions + m, i]*Speed[m][i]*Time[m]*ram[m]/ram_denominator(i,m) for m in range(num_functions)) for n in range(num_workflows)) if stochastic_decomp else 0
+                model.addConstr(M[i] == quicksum(quicksum(
+                    quicksum(lam[k]*H[k, n] * P[n * num_functions + m, i]*Speed[m][i]*Time[m]*ram[m]/ram_denominator(i,m) for m in range(num_functions)) for k in
+                    range(num_leaves)) for n in range(num_workflows))+virt_M+curr_util,
                                 "Aux cons")
             obj+=w_3*M[i]**2#quicksum(H[r,n]*M[i,n] for r in range(num_leaves))
         # The three penalty/cost groups above form the utilization cost U of Eq. (1).

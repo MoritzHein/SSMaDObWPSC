@@ -54,6 +54,54 @@ def load_json_cached(path):
         return data
 
 
+# Branch traversal order. The branch-membership matrix b only records WHICH
+# functions belong to a branch, so np.where(b[s] == 1) returns them in ascending
+# function id - which is not the order the DAG executes them in. The workflow
+# generator writes genuinely non-monotone paths (e.g. [0, 4, 3, 1, 2, 5]), and
+# optimization.py builds the successor matrix a - and hence the model's T[n]
+# constraint - from exactly those ordered paths. Deriving the traversal from b
+# therefore charges execution times, transfer latencies and data-transfer costs
+# along a chain the optimizer never modelled.
+#
+# The order is taken from the workflow config; b still decides MEMBERSHIP, so the
+# b_full truncation that drops the shared start/end functions from the secondary
+# branches keeps working unchanged. Since b is built as b[s, path] = 1, every
+# member of b[s] appears in paths[str(s)] and the filter below can only reorder,
+# never add or drop a function.
+_PATH_ORDER_WARNED = set()
+
+
+def path_order_of(wf_conf):
+        """Per-branch function lists in EXECUTION order, from the workflow config."""
+        paths = (wf_conf or {}).get('paths', {})
+        try:
+                num_paths = int(paths.get('num_paths', 0))
+        except (TypeError, ValueError):
+                return []
+        return [list(paths.get(str(s), [])) for s in range(num_paths)]
+
+
+def branch_functions(b, s, path_order=None):
+        """Functions of branch s of the branch matrix b, in execution order."""
+        if not isinstance(b, (list, np.ndarray)) or len(b) <= s:
+                return []
+        row = b[s]
+        order = None
+        if path_order is not None and len(path_order) > s:
+                order = path_order[s]
+        if not order:
+                # No ordered path available: fall back to the historical ascending
+                # order, but say so - a workflow config without "paths" is malformed
+                # and the traversal is then only as good as the function numbering.
+                key = id(b)
+                if key not in _PATH_ORDER_WARNED:
+                        _PATH_ORDER_WARNED.add(key)
+                        print("WARNING: no ordered 'paths' for this workflow; falling back "
+                              "to ascending function order for the branch traversal.")
+                return np.where(np.array(row) == 1)[0].tolist()
+        return [int(m) for m in order if 0 <= int(m) < len(row) and row[int(m)] == 1]
+
+
 if __name__ == "__main__":
 
 
@@ -502,6 +550,8 @@ if __name__ == "__main__":
                 perwf[w] = {}
                 num_deployment = wf_conf.get('deployment_number', 1)
                 num_paths_w = wf_conf.get('paths', {}).get('num_paths', 0)
+                # Execution order of each branch (see branch_functions above).
+                path_order = path_order_of(wf_conf)
 
                 # Execution plan (nodes/durations/rams) of a given deployment d;
                 # shared by the deterministic and stochastic paths.
@@ -542,7 +592,7 @@ if __name__ == "__main__":
                 def plan_base_T(sel_places, durs, lf):
                         base_T_paths = []
                         for s in range(num_paths_w):
-                                func_nums = np.where(np.array(b[s]) == 1)[0].tolist() if isinstance(b, (list, np.ndarray)) and len(b) > s else []
+                                func_nums = branch_functions(b, s, path_order)
                                 tot = 0
                                 for idx_m in func_nums:
                                         tot += durs[idx_m]
@@ -593,6 +643,7 @@ if __name__ == "__main__":
                 perwf[w]['a'] = a
                 perwf[w]['b'] = b
                 perwf[w]['num_paths'] = num_paths_w
+                perwf[w]['path_order'] = path_order
 
         # ---- Discrete-event simulation state (decomposed solution):
         # node_active[i] holds the currently running executions on node i as
@@ -666,14 +717,18 @@ if __name__ == "__main__":
                                         b_mat = perwf[w].get('b', [])
                                         num_paths_local = perwf[w].get('num_paths', 0)
                                         for s in range(num_paths_local):
-                                                func_nums = np.where(np.array(b_mat[s])==1)[0].tolist() if isinstance(b_mat, (list, np.ndarray)) and len(b_mat) > s else []
+                                                func_nums = branch_functions(b_mat, s, perwf[w].get('path_order'))
 
                                                 tot = 0
                                                 for idx_m in func_nums:
                                                         tot += durs[idx_m]
 
-                                                        if idx_m < len(func_nums) - 1:
-                                                                next_m = func_nums[func_nums.index(idx_m) + 1]
+                                                        # func_nums holds function IDs, so the successor
+                                                        # test must compare POSITIONS in that list, not
+                                                        # the function id against the list length.
+                                                        pos = func_nums.index(idx_m)
+                                                        if pos < len(func_nums) - 1:
+                                                                next_m = func_nums[pos + 1]
                                                                 next_place = sel_places[next_m]
                                                         else:
                                                                 next_place = leaf + num_other
@@ -732,7 +787,10 @@ if __name__ == "__main__":
                                                 req_done = last_end + final_transfer
                                         else:
                                                 req_done = req['arrival']
-                                        req_done_list.append(req_done)
+                                        # req_done_list collects RESPONSE TIMES (the w_2 term of the
+                                        # overall cost is sum(req_done_list)), so the arrival time has
+                                        # to be subtracted here exactly as in the default branch below.
+                                        req_done_list.append(req_done - req['arrival'])
                                         wait = max(0, req_done - req['arrival'] - req['base_T'])
                                         waiting_acc[w, leaf] += wait
 
@@ -835,12 +893,16 @@ if __name__ == "__main__":
                                                 deployment_id = int(info.get('deployment', w))
                                                 base_T_paths = []
                                                 for s in range(num_paths_local):
-                                                        func_nums = np.where(np.array(b_mat[s])==1)[0].tolist() if isinstance(b_mat, (list, np.ndarray)) and len(b_mat) > s else []
+                                                        func_nums = branch_functions(b_mat, s, perwf[w].get('path_order'))
                                                         tot = 0
                                                         for idx_m in func_nums:
                                                                 tot += durs[idx_m]
-                                                                if idx_m < len(func_nums) - 1:
-                                                                        next_m = func_nums[func_nums.index(idx_m) + 1]
+                                                                # Positional successor (see plan_base_T);
+                                                                # comparing the function id idx_m against
+                                                                # len(func_nums) is wrong on branchy DAGs.
+                                                                pos = func_nums.index(idx_m)
+                                                                if pos < len(func_nums) - 1:
+                                                                        next_m = func_nums[pos + 1]
                                                                         next_place = sel_places[next_m]
                                                                 else:
                                                                         next_place = leaf + num_other
@@ -877,7 +939,7 @@ if __name__ == "__main__":
                                                 b_mat = perwf[w].get('b', [])
                                                 num_paths_local = perwf[w].get('num_paths', 0)
                                                 for s in range(num_paths_local):
-                                                        func_nums = np.where(np.array(b_mat[s])==1)[0].tolist() if isinstance(b_mat, (list, np.ndarray)) and len(b_mat) > s else []
+                                                        func_nums = branch_functions(b_mat, s, perwf[w].get('path_order'))
 
                                                         curr_time = arrival
                                                         for idx_m in func_nums:
@@ -891,16 +953,22 @@ if __name__ == "__main__":
                                                                 # the blocking mechanisms).
                                                                 while True:
 
-                                                                        used = sum(
-                                                                                entry[1] for entry in node_active[node]
-                                                                                if entry[0] > curr_time)
+                                                                        # An entry occupies the node only while it is
+                                                                        # actually running: [entry[5], entry[0]). Testing
+                                                                        # end > curr_time alone would also count bookings
+                                                                        # that START later (this loop books far into the
+                                                                        # future), which invents blocking that never
+                                                                        # happens. Compare against the candidate slot
+                                                                        # [curr_time, curr_time + dur).
+                                                                        slot_end = curr_time + dur
+                                                                        overlapping = [entry for entry in node_active[node]
+                                                                                       if entry[5] < slot_end and curr_time < entry[0]]
+                                                                        used = sum(entry[1] for entry in overlapping)
 
-                                                                        func_busy_ends = [entry[0] for entry in
-                                                                                          node_active[node] if
-                                                                                          len(entry) >= 4 and entry[
-                                                                                                  0] > curr_time and
-                                                                                          entry[2] == deployment_id and entry[
-                                                                                                  3] == idx_m and entry[4] == w]
+                                                                        func_busy_ends = [entry[0] for entry in overlapping
+                                                                                          if entry[2] == deployment_id
+                                                                                          and entry[3] == idx_m
+                                                                                          and entry[4] == w]
 
                                                                         if used + ram_req <= node_ram_max[node] and (
                                                                         not func_busy_ends):
@@ -908,10 +976,12 @@ if __name__ == "__main__":
                                                                                 start = curr_time
                                                                                 break
 
-                                                                        future_ends_node = [entry[0] for entry in
-                                                                                            node_active[node] if
-                                                                                            entry[0] > curr_time]
-                                                                        future_ends = future_ends_node + func_busy_ends
+                                                                        # Capacity and the function deployment are only
+                                                                        # released by an execution ending, so the next
+                                                                        # candidate start is the earliest future end.
+                                                                        future_ends = [entry[0] for entry in
+                                                                                       node_active[node] if
+                                                                                       entry[0] > curr_time]
                                                                         if future_ends:
                                                                                 curr_time = int(min(future_ends))
                                                                         else:
@@ -919,7 +989,7 @@ if __name__ == "__main__":
                                                                                 break
                                                                 endt = start + dur
 
-                                                                node_active[node].append((endt, ram_req, deployment_id, idx_m,w))
+                                                                node_active[node].append((endt, ram_req, deployment_id, idx_m, w, start))
 
                                                                 # Move on to the successor: execution end plus the
                                                                 # transfer latency to the next function's node (or
@@ -961,7 +1031,11 @@ if __name__ == "__main__":
 
                         for ni in range(num_nodes_global):
 
-                                used_now = sum(entry[1] for entry in node_active[ni] if entry[0] > cur_t)
+                                # RAM in use at cur_t = executions already started and
+                                # not yet finished; bookings placed further in the
+                                # future do not occupy the node now.
+                                used_now = sum(entry[1] for entry in node_active[ni]
+                                               if entry[5] <= cur_t < entry[0])
                                 ram_area[ni] += used_now
                                 per_node_util[cur_t, ni] = used_now
 
@@ -994,6 +1068,8 @@ if __name__ == "__main__":
                 L=placement_config['L']
                 S=placement_config['S']
                 num_paths= workflow_config['paths']['num_paths']
+                # Execution order of each branch (see branch_functions).
+                path_order = path_order_of(workflow_config)
                 b = placement_config['b']
                 a = placement_config['a']
                 num_deployment=workflow_config["deployment_number"]
@@ -1032,7 +1108,7 @@ if __name__ == "__main__":
                                 pred_k_list, lat_upward_list, pos_list = upward_trajectory(k + num_other)
                                 L_func = np.zeros((num_functions, 1))
 
-                                func_nums = np.where(np.array(b[s])==1)[0].tolist()
+                                func_nums = branch_functions(b, s, path_order)
 
                                 # Trace function m through all levels of the decomposition
                                 # (r=0 is the top problem); costs/latencies are accumulated
@@ -1101,11 +1177,17 @@ if __name__ == "__main__":
                                                                         pricing_data_sent = curr_cloud['providers'][f"provider_{selected_place}"]['pricing_data_sent']
                                                                         D_in_0=curr_workflow['input_data'] * pricing_data_sent
 
-                                                        if m < len(func_nums) - 1:
+                                                        # m is a function ID; func_nums must be indexed by
+                                                        # POSITION, and the end-of-branch test compares
+                                                        # positions too. Getting either wrong makes D_func
+                                                        # bill the transfer to the wrong successor node on
+                                                        # branches that are not a 0..k prefix.
+                                                        pos = func_nums.index(m)
+                                                        if pos < len(func_nums) - 1:
 
                                                                 next_selected_place = curr_P[
                                                                         selected_workflow * num_functions + func_nums[
-                                                                                m + 1]].index(1)
+                                                                                pos + 1]].index(1)
                                                         else:
                                                                 next_selected_place = pred_k_list[1]
                                                         D_func[m]=D[m][selected_place][next_selected_place]
@@ -1424,6 +1506,8 @@ if __name__ == "__main__":
                         perwf[w] = {}
                         num_deployment = wf_conf.get('deployment_number', 1)
                         num_paths_w = wf_conf.get('paths', {}).get('num_paths', 0)
+                        # Execution order of each branch (see branch_functions above).
+                        path_order = path_order_of(wf_conf)
 
                         # Build the execution plan (nodes/durations/rams) of a given
                         # deployment d for this workflow. Shared by the deterministic
@@ -1466,7 +1550,7 @@ if __name__ == "__main__":
                         def plan_base_T(sel_places, durs, lf):
                                 base_T_paths = []
                                 for s in range(num_paths_w):
-                                        func_nums = np.where(np.array(b[s]) == 1)[0].tolist() if isinstance(b, (list, np.ndarray)) and len(b) > s else []
+                                        func_nums = branch_functions(b, s, path_order)
                                         tot = 0
                                         for idx_m in func_nums:
                                                 tot += durs[idx_m]
@@ -1520,6 +1604,7 @@ if __name__ == "__main__":
                         perwf[w]['a'] = a
                         perwf[w]['b'] = b
                         perwf[w]['num_paths'] = num_paths_w
+                        perwf[w]['path_order'] = path_order
 
                 curr_utilization=np.zeros((num_nodes_global,1))
                 func_blocked=np.zeros((num_workflows,num_functions))
@@ -1575,13 +1660,15 @@ if __name__ == "__main__":
                                                 b_mat = perwf[w].get('b', [])
                                                 num_paths_local = perwf[w].get('num_paths', 0)
                                                 for s in range(num_paths_local):
-                                                        func_nums = np.where(np.array(b_mat[s])==1)[0].tolist() if isinstance(b_mat, (list, np.ndarray)) and len(b_mat) > s else []
+                                                        func_nums = branch_functions(b_mat, s, perwf[w].get('path_order'))
                                                         tot = 0
                                                         for idx_m in func_nums:
                                                                 tot += durs[idx_m]
 
-                                                                if idx_m < len(func_nums) - 1:
-                                                                        next_m = func_nums[func_nums.index(idx_m) + 1]
+                                                                # Positional successor (see plan_base_T).
+                                                                pos = func_nums.index(idx_m)
+                                                                if pos < len(func_nums) - 1:
+                                                                        next_m = func_nums[pos + 1]
                                                                         next_place = sel_places[next_m]
                                                                 else:
                                                                         next_place = leaf + num_other
@@ -1636,7 +1723,9 @@ if __name__ == "__main__":
                                                         req_done = last_end + final_transfer
                                                 else:
                                                         req_done = req['arrival']
-                                                req_done_list.append(req_done)
+                                                # Response time, not absolute completion time - see the
+                                                # decomposed branch above.
+                                                req_done_list.append(req_done - req['arrival'])
                                                 wait = max(0, req_done - req['arrival'] - req['base_T'])
                                                 waiting_acc[w, leaf] += wait
 
@@ -1730,13 +1819,15 @@ if __name__ == "__main__":
                                                         base_T_paths = []
                                                         for s in range(num_paths_local):
                                                                 b_mat = perwf[w].get('b', [])
-                                                                func_nums = np.where(np.array(b_mat[s])==1)[0].tolist() if isinstance(b_mat, (list, np.ndarray)) and len(b_mat) > s else []
+                                                                func_nums = branch_functions(b_mat, s, perwf[w].get('path_order'))
                                                                 tot = 0
                                                                 for idx_m in func_nums:
                                                                         tot += durs[idx_m]
 
-                                                                        if idx_m < len(func_nums) - 1:
-                                                                                next_m = func_nums[func_nums.index(idx_m)+1]
+                                                                        # Positional successor (see plan_base_T).
+                                                                        pos = func_nums.index(idx_m)
+                                                                        if pos < len(func_nums) - 1:
+                                                                                next_m = func_nums[pos + 1]
                                                                                 next_place = sel_places[next_m]
                                                                         else:
                                                                                 next_place = leaf + num_other
@@ -1767,7 +1858,7 @@ if __name__ == "__main__":
                                                         b_mat = perwf[w].get('b', [])
                                                         num_paths_local = perwf[w].get('num_paths', 0)
                                                         for s in range(num_paths_local):
-                                                                func_nums = np.where(np.array(b_mat[s]) == 1)[0].tolist() if isinstance(b_mat, list) and len(b_mat) > s else []
+                                                                func_nums = branch_functions(b_mat, s, perwf[w].get('path_order'))
                                                                 curr_time = arrival
                                                                 for idx_m in func_nums:
                                                                         node = sel_places[idx_m]
@@ -1776,22 +1867,25 @@ if __name__ == "__main__":
 
                                                                         while True:
 
-                                                                                used = sum(entry[1] for entry in node_active[node] if entry[0] > curr_time)
+                                                                                # Only executions whose [start, end) interval
+                                                                                # overlaps the candidate slot occupy the node -
+                                                                                # see the decomposed loop above.
+                                                                                slot_end = curr_time + dur
+                                                                                overlapping = [entry for entry in node_active[node]
+                                                                                               if entry[5] < slot_end and curr_time < entry[0]]
+                                                                                used = sum(entry[1] for entry in overlapping)
 
-                                                                                func_busy_ends = [entry[0] for entry in
-                                                                                          node_active[node] if
-                                                                                          len(entry) >= 4 and entry[
-                                                                                                  0] > curr_time and
-                                                                                          entry[2] == deployment_id and entry[
-                                                                                                  3] == idx_m and entry[4] == w]
+                                                                                func_busy_ends = [entry[0] for entry in overlapping
+                                                                                                  if entry[2] == deployment_id
+                                                                                                  and entry[3] == idx_m
+                                                                                                  and entry[4] == w]
 
                                                                                 if used + ram_req <= node_ram_max[node] and (not func_busy_ends):
                                                                                         start = curr_time
                                                                                         break
 
 
-                                                                                future_ends_node = [entry[0] for entry in node_active[node] if entry[0] > curr_time]
-                                                                                future_ends = future_ends_node + func_busy_ends
+                                                                                future_ends = [entry[0] for entry in node_active[node] if entry[0] > curr_time]
                                                                                 if future_ends:
                                                                                         curr_time = int(min(future_ends))
                                                                                 else:
@@ -1799,7 +1893,7 @@ if __name__ == "__main__":
                                                                                         break
                                                                         endt = start + dur
 
-                                                                        node_active[node].append((endt, ram_req, deployment_id, idx_m,w))
+                                                                        node_active[node].append((endt, ram_req, deployment_id, idx_m, w, start))
 
                                                                         idx_pos = func_nums.index(idx_m)
                                                                         if idx_pos < len(func_nums) - 1:
@@ -1835,7 +1929,9 @@ if __name__ == "__main__":
                                                         req_id_counter += 1
 
                                 for ni in range(num_nodes_global):
-                                        used_now = sum(entry[1] for entry in node_active[ni] if entry[0] > cur_t)
+                                        # Started and not yet finished - see above.
+                                        used_now = sum(entry[1] for entry in node_active[ni]
+                                                       if entry[5] <= cur_t < entry[0])
                                         ram_area[ni] += used_now
                                         per_node_util[cur_t, ni] = used_now
 
@@ -1873,6 +1969,8 @@ if __name__ == "__main__":
                         L = cloud_config.get('L', placement_config['L'])
                         S = placement_config['S']
                         num_paths = workflow_config['paths']['num_paths']
+                        # Execution order of each branch (see branch_functions).
+                        path_order = path_order_of(workflow_config)
                         b = placement_config['b']
                         a = placement_config['a']
                         select_cost=0
@@ -1899,12 +1997,14 @@ if __name__ == "__main__":
                                 for s in range(num_paths):
                                         pred_k = k + num_other
 
-                                        func_nums = np.where(np.array(b[s]) == 1)[0].tolist()
+                                        func_nums = branch_functions(b, s, path_order)
 
                                         for r,m in enumerate(func_nums):
 
                                                 selected_place = P[selected_workflow * num_functions + m].index(1)
-                                                if m<len(func_nums)-1:
+                                                # r is the POSITION of m in func_nums (enumerate), so the
+                                                # end-of-branch test must use r, not the function id m.
+                                                if r < len(func_nums)-1:
 
                                                         next_selected_place=P[selected_workflow * num_functions + func_nums[r+1]].index(1)
                                                 else:

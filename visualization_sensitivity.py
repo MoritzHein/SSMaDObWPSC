@@ -165,7 +165,7 @@ def plot_response_curves(sweep, export_path, targets, suffix=""):
     if not params:
         return
     any_adapted = False
-    fig, axes = plt.subplots(1, len(targets), figsize=(4.5 * len(targets), 3.5),
+    fig, axes = plt.subplots(1, len(targets), figsize=(3.5 * len(targets), 3),
                              sharex=True, sharey=True)
     for ax, (target, title) in zip(np.atleast_1d(axes), targets):
         base = sweep.get("baseline", {}).get(target)
@@ -191,16 +191,16 @@ def plot_response_curves(sweep, export_path, targets, suffix=""):
         if base is not None:
             ax.axhline(base, color="k", linestyle=":", linewidth=1)
         ax.axvline(1.0, color="grey", linestyle="--", linewidth=0.8)
-        ax.set_xlabel("scale factor")
-        ax.set_ylabel(r"Overall cost $C$")
+        ax.set_xlabel("scale factor",fontsize=11)
+        ax.set_ylabel(r"Overall cost $C$",fontsize=11)
         ax.set_title(title)
     handles, names = np.atleast_1d(axes)[0].get_legend_handles_labels()
     if any_adapted:
         handles = handles + [Line2D([0], [0], color="k", linestyle="-"),
                              Line2D([0], [0], color="k", linestyle="--")]
         names = names + ["nominal placement", "adapted placement"]
-    np.atleast_1d(axes)[0].legend(handles, names, loc="best", fontsize=8)
-    fig.suptitle("Cost response to each uncertainty")
+    np.atleast_1d(axes)[0].legend(handles, names, loc="best", fontsize=10,ncol=1)
+    #fig.suptitle("Cost response to each uncertainty")
     save(fig, export_path, "sensitivity_response_curves", suffix)
 
 

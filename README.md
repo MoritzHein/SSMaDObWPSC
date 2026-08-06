@@ -124,7 +124,58 @@ study, and a regression-based estimate of the individual effects to
 solution, and the titles state whether the comparison is the centralized
 optimization or the heuristic (read from `settings/parameters_N.json`).
 
+## Optional model flags
+
+These keys in `settings/parameters_N.json` switch on model variants. **Every one
+defaults to the behaviour of the original model, so a parameter file that omits
+them reproduces the published runs.** Placements are not bit-comparable across
+different settings.
+
+| key | values | default | what it does |
+|---|---|---|---|
+| `stochastic_selection` | `true` / `false` | `false` | Relaxes the selection `H_{k,n}` from a one-hot choice to a stochastic routing policy in `[0,1]`, and samples each request's deployment from it during simulation. Full description in [`stochastic_selection.md`](stochastic_selection.md). |
+| `ram_eligibility` | `true` / `false` | `false` | Forbids placing a function on a node whose subtree contains no physical node large enough to host it. A necessary condition for any physical realisation, so the decomposition stays a relaxation. See [`ram_capacity_model.md`](ram_capacity_model.md). |
+| `ram_capacity_norm` | `"off"` / `"l1"` / `"l2"` | `"off"` | Capacity used to normalise the node utilization `M_i`, restricted per function to the subtree nodes that can host it. `"off"` keeps the aggregate `RAM_max,i`; `"l2"` is the value that makes an aggregated node's squared utilization match the smallest total its children can achieve. Only affects levels above the physical one. See [`ram_capacity_model.md`](ram_capacity_model.md). |
+
+Note on comparing runs: the placement problem is a nonconvex MIQCQP solved to
+`MIPGap 0`, and when several placements attain the same optimum the one Gurobi
+returns is arbitrary. Re-solving the *identical* model under different Gurobi
+`Seed` values moved the simulated cost by up to 236 on `run_141` and 1347 (9.3%)
+on `run_140`. Differences below that scale between two model variants are not
+evidence; compare objective values or seed-replicated ranges instead.
+
 ## Changelog / reproducibility notes
+
+**2026-08 — RAM capacity model (`ram_eligibility`, `ram_capacity_norm`).** Above
+the last level a "node" is a whole region, and `generate_cloud` Dirichlet-splits
+a parent's RAM over its children, so the aggregated capacity is the *sum* of the
+subtree while a function must fit on *one* physical node. On `run_141` region 2
+sums to 265.1 but its largest node is 52.3, so it can host only 22 of 48
+functions while the top level scores it as 265.1 of headroom; 16–18% of the
+simulated waiting time came from functions placed where no node could ever hold
+them. Two independently gated options address this — a hard per-function
+eligibility constraint and a per-function capacity norm for `M_i` — both
+defaulting to the previous behaviour. Each node's cloud config gains a
+`ram_leaf_profile` field. Rationale, derivation and limits in
+[`ram_capacity_model.md`](ram_capacity_model.md).
+
+Fixed unconditionally in the same change: `M_i` used the bare execution time
+`Time[m]` while the function-utilization penalty `u_{n,m}` used
+`Speed[m][i]*Time[m]`, so `M_i` overstated the RAM held on cloud nodes by
+`1/speedup`. Objective-neutral in practice (cloud `RAM_max` is 1e8; measured
+worst relative objective change 3.7e-9 over 50 subproblems), but it does change
+which of several equal-optimum placements the solver returns.
+
+**2026-08 — simulator and accumulator fixes.** Six pre-existing defects were
+corrected: (A) the node-occupancy test ignored booking start times, so
+executions scheduled in the future blocked the present; (B) `update_cloud_config`
+added `M[i]` to the utilization although `M[i]` already contains it, doubling the
+baseline with every workflow; (C)/(D) branch-successor lookups compared a
+function id against a list length; (E) the `lazy_start` branch recorded absolute
+completion times instead of response times; (F) branch traversal used ascending
+function ids from the membership matrix `b` rather than the execution order in
+the workflow config's `paths`, which is non-monotone for half the generated
+workflows. Results from before these fixes are not comparable.
 
 **2026-07 — objective index fixes in `solve_opt` (optimization.py).** Two
 indexing errors in the objective were fixed: (1) the quadratic function-
