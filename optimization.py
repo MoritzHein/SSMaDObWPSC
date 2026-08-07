@@ -15,7 +15,7 @@ from typing import Any, Dict
 import time
 
 # %%
-def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, Any], gap=0,w_1=1,w_2=1,w_3=1,provider_name_list=[],provider_cost_list=[],heuristic=False,relax_selection=False,ram_eligibility=False,ram_capacity_norm="off"):
+def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, Any], gap=0,w_1=1,w_2=1,w_3=1,provider_name_list=[],provider_cost_list=[],heuristic=False,relax_selection=False,ram_eligibility=False,ram_capacity_norm="off",time_limit=None):
     """Solve the placement + selection problem (Eq. (1) of the paper) with Gurobi.
 
     Parameters
@@ -74,6 +74,14 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
     model= Model("FaaS")
     if gap>0:
         model.setParam('MIPGap', gap)
+    # Wall-clock cap on a single solve. Needed for the CENTRALIZED comparison
+    # under relax_selection: the continuous H turns the model into a nonconvex
+    # MIQCQP that Gurobi cannot close even on 9 nodes. With a limit the solve
+    # returns its incumbent and the achieved MIPGap is reported by the caller,
+    # so a non-proven comparison is visible instead of silent. None => unlimited
+    # => previous behaviour.
+    if time_limit:
+        model.setParam('TimeLimit', float(time_limit))
     # Model parameters (cf. Table 1 of the paper):
     C=np.zeros((num_functions,num_nodes))         # C_{m,i}: cost to execute function m on node i
     D=np.zeros((num_functions, num_nodes,num_nodes))  # D_{m,i,j}: cost to send output of m from node i to node j
@@ -544,12 +552,20 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
             # An infeasible/unbounded subproblem means the decomposition's
             # demand/pruning bookkeeping is inconsistent -- never write a
             # degenerate solution for it (that silently corrupts the run).
-            if model.status != GRB.OPTIMAL:
+            # A solve stopped by TimeLimit is acceptable ONLY if it found an
+            # incumbent; the achieved MIPGap is reported by the caller so the
+            # solution is never silently taken for a proven optimum.
+            accepted = (model.status == GRB.OPTIMAL
+                        or (model.status == GRB.TIME_LIMIT and model.SolCount > 0))
+            if not accepted:
                 raise RuntimeError(
                     f"Subproblem {deployment_workflow.get('name', '?')}: Gurobi "
                     f"finished with status {model.status} (2 = OPTIMAL). The "
                     f"model is infeasible/unbounded or the solve failed; the "
                     f"decomposition bookkeeping for this region is inconsistent.")
+            if model.status == GRB.TIME_LIMIT:
+                print(f"WARNING: time limit reached, using the incumbent "
+                      f"(MIPGap {model.MIPGap:.4f}) -- NOT a proven optimum.")
 
             t2=time.time()
             t=t2-t1

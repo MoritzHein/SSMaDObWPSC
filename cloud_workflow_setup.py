@@ -257,7 +257,12 @@ def update_requirements_config(requirements_workflow_config, P,H, current_node,c
 # and the list of branches (each a list of function indices).
 def generate_connected_graph_with_paths(n_nodes, n_parallel_paths=2, seed=42):
     # assert n_nodes >= 4, "Need at least 4 nodes to have interesting parallel paths"
-    np.random.seed(seed)
+    # NOTE: this function draws ONLY from its own `rng` below. It used to open
+    # with np.random.seed(seed) as well, which did nothing here but reset the
+    # CALLER's global stream -- generate_random_workflows passed the workflow
+    # index as the seed, so every workflow after the first was sampled from a
+    # run-seed-independent stream and the DAG topology depended only on the
+    # index. Do not reintroduce a global reseed here.
     rng = np.random.default_rng(seed)
     G = nx.DiGraph()
 
@@ -338,7 +343,11 @@ def generate_random_workflows(num_workflows,num_opts, config_random_workflows,pr
         #    config["num_requests"][name]=value
         # config["num_requests"]={}
         n_parallel_paths = np.random.randint(1, num_functions - 1)
-        G, paths = generate_connected_graph_with_paths(num_functions, n_parallel_paths=n_parallel_paths, seed=i)
+        # Draw the DAG seed from this generator's own stream, so the topology
+        # responds to the run seed like every other workflow attribute. Passing
+        # the workflow index i made workflow i's shape identical across runs.
+        graph_seed = int(np.random.randint(0, 2 ** 31 - 1))
+        G, paths = generate_connected_graph_with_paths(num_functions, n_parallel_paths=n_parallel_paths, seed=graph_seed)
         config["functions"] = {}
         config["paths"] = {
             "num_paths": n_parallel_paths,
@@ -411,7 +420,10 @@ def generate_random_workflows(num_workflows,num_opts, config_random_workflows,pr
 # Writes one requirements_cloud_<level>_<region>.json per subproblem and a
 # general_config.json describing the whole hierarchy.
 def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyfaas"],num_tiny_first=2,provider_cost_list=[],provider_dev=[],config_random_cloud=[],seed=42):
-    np.random.seed(42)
+    # Honour the run's seed. This used to be a hard-coded 42, so EVERY run
+    # produced the identical architecture no matter what "seed" said in
+    # parameters_<N>.json -- a multi-seed study varied only the workflows.
+    np.random.seed(seed)
     if not os.path.exists(os.path.join("cloud",f"run_{num_run}")):
         os.mkdir(os.path.join("cloud",f"run_{num_run}"))
     speedup_min=config_random_cloud["speedup_min"]

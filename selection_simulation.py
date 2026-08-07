@@ -237,7 +237,12 @@ if __name__ == "__main__":
 
         # ---- Simulation setup: request rate lambda_k of every (workflow, leaf)
         # pair, taken from the physical leaves of the flattened architecture.
-        np.random.seed(42)
+        # The Monte-Carlo seed is a parameter so the SAME placement can be
+        # re-evaluated on independent request streams (sampling error of the
+        # cost); absent => 42 => the previous, fixed stream. The deployment
+        # sampler is offset by 81 so the default reproduces the old 42/123 pair.
+        simulation_seed = int(parameter_general_config.get("simulation_seed", 42))
+        np.random.seed(simulation_seed)
         sim_time = parameter_general_config["simulation_time"]
         time_cost_all = 0
         money_cost_all = 0
@@ -666,11 +671,11 @@ if __name__ == "__main__":
         req_id_counter = 0
         req_done_list = []
 
-        rng = np.random.default_rng(42)
+        rng = np.random.default_rng(simulation_seed)
         # Stage 2 stochastic decomposition: separate RNG for per-request deployment
         # sampling (keeps the Poisson stream identical to the deterministic run),
         # and per-(workflow, leaf, deployment) counters for the Monte-Carlo cost.
-        rng_sel = np.random.default_rng(123)
+        rng_sel = np.random.default_rng(simulation_seed + 81)
         sel_counts = [[{} for _ in range(num_leaves)] for _ in range(num_workflows)]
 
         # Simulate second by second: sample Poisson arrivals for every
@@ -1298,7 +1303,7 @@ if __name__ == "__main__":
         # the flattened architecture - no hierarchy reconstruction is needed
         # (reconstruct_full_solution only serves as fallback).
         if comparison:
-                np.random.seed(42)
+                np.random.seed(simulation_seed)
                 sim_time=parameter_general_config["simulation_time"]
                 time_cost_all=0
                 money_cost_all=0
@@ -1621,10 +1626,10 @@ if __name__ == "__main__":
                 request_logs = []
                 req_id_counter = 0
                 req_done_list=[]
-                rng = np.random.default_rng(42)
+                rng = np.random.default_rng(simulation_seed)
                 # Separate RNG stream for deployment sampling so the Poisson
                 # request stream (rng) stays identical to the deterministic run.
-                rng_sel = np.random.default_rng(123)
+                rng_sel = np.random.default_rng(simulation_seed + 81)
                 # sel_counts[w][leaf][d] = number of requests that sampled
                 # deployment d; drives the Monte-Carlo monetary cost below.
                 sel_counts = [[{} for _ in range(num_leaves)] for _ in range(num_workflows)]

@@ -124,6 +124,68 @@ study, and a regression-based estimate of the individual effects to
 solution, and the titles state whether the comparison is the centralized
 optimization or the heuristic (read from `settings/parameters_N.json`).
 
+f) RAM capacity model x utilization weight x selection policy
+
+Compares the deterministic and the stochastic selection policy across the
+utilization weight `w_3`, once with the RAM capacity model switched off and once
+with it on, on the standard case-study architecture (2 levels, 10 workflows,
+10-11 nodes per region, i.e. 40 physical nodes and 20 leaves).
+
+Generate the parameter files:
+
+```ram_w3_experiments.py```
+
+This writes **`settings/parameters_300.json` ... `settings/parameters_323.json`**
+(24 runs) plus the manifest `settings/ram_w3_campaign.json`, from the template
+`settings/parameters_1.json`. The grid is
+
+| axis | values |
+|---|---|
+| RAM capacity model | `off` (`ram_eligibility=false`, `ram_capacity_norm="off"`) and `l2` (`true`, `"l2"`) |
+| `w_3` | 0.5, 1.0, 1.5, 2.0, 2.5, 3.0 |
+| selection policy | deterministic, stochastic (`stochastic_selection`) |
+
+with the run number of a cell given by
+`300 + ram_index*12 + w3_index*2 + policy_index` — runs 300-311 are the
+RAM-model-off half and 312-323 the `l2` half. Nothing downstream hard-codes that
+arithmetic; the manifest carries the mapping.
+
+In the command line run
+
+```run_ram_w3_study.bat```
+
+which solves and simulates all 24 runs and then calls
+
+```resimulate_seeds.py --seeds=10```
+
+to re-simulate every placement on ten independent request streams *without*
+re-solving (a single simulation at `simulation_time=200` carries roughly 10%
+Monte-Carlo noise, which is larger than several of the effects being compared).
+The per-stream costs land in `results/run_N/results_seeds.json`.
+
+No solver parameter needs to be touched: the generated files inherit
+`own_gap = 0` and `comparison_gap = 0` from the template and set no time limit,
+so every subproblem is solved to proven optimality. Budget hours rather than
+minutes for the twelve stochastic runs — relaxing `H` turns the subproblems into
+nonconvex MIQCQPs, and a stochastic run takes upwards of ten minutes against
+about twenty seconds for a deterministic one. The achieved gap of every
+subproblem is recorded in `results/run_N/time.json` under `own_mipgap`; with the
+default settings these are all zero. Setting `OWN_TIME_LIMIT` in
+`ram_w3_experiments.py` trades that guarantee for speed and makes the solutions
+incumbents rather than optima — use it for scanning only.
+
+To generate the figure run
+
+```visualization_ram_w3.py```
+
+which saves `ram_w3_comparison.pdf/.png` to `results/run_300/`: two subplots
+sharing a y-axis (RAM model off on top, eligibility + l2 below), `w_3` on the
+x-axis, and a deterministic/stochastic bar pair per weight. Each bar is stacked
+into `w_1*M + w_2*B + w_2*W` (monetary, basic time, waiting), so its height is
+the overall cost; the measured `overall_cost` is drawn as a separate marker with
+a 95% confidence interval over the request streams. The script also prints the
+numbers behind the figure.
+
 ## Optional model flags
 
 These keys in `settings/parameters_N.json` switch on model variants. **Every one
@@ -145,6 +207,33 @@ on `run_140`. Differences below that scale between two model variants are not
 evidence; compare objective values or seed-replicated ranges instead.
 
 ## Changelog / reproducibility notes
+
+**2026-08 — the `seed` in parameters_N.json now reaches the architecture.**
+`generate_cloud` accepted a `seed` argument but opened with a hard-coded
+`np.random.seed(42)`, so **every run produced the byte-identical architecture no
+matter what `seed` said** — a multi-seed study varied only the workflows. Now
+fixed. Verified: seeds 42-47 previously gave 1 distinct architecture, now 6
+(total edge RAM 443.6 - 1710.2 on the 9-node example). Consequence: any stored
+run whose `seed` is not 42 was solved on the seed-42 architecture; re-running it
+now produces a different instance and its stored results are not comparable.
+
+**2026-08 — the `seed` now reaches the workflows as well.** The companion half of
+the same problem: `generate_random_workflows` built each workflow's DAG with
+`generate_connected_graph_with_paths(..., seed=i)`, and that function opened with
+`np.random.seed(seed)`. It never used the global stream itself (it builds its own
+`default_rng`), so the call was dead code inside the function and pure collateral
+damage outside — it reset the *caller's* stream to the workflow index. Only the
+two draws before the first graph call responded to the run seed; workflows 3-5
+were identical across all seeds and seeds 45/47 produced byte-identical workflow
+sets. Fixed by removing the global reseed and drawing the DAG seed from the
+generator's own stream. Verified: same seed twice is byte-identical; all 10 pairs
+of seeds 43-47 now differ in **all five** workflows, and every workflow has a
+distinct DAG topology per seed.
+
+Together with the architecture fix above, `seed` now varies both the
+infrastructure and the workload, so different seeds are genuinely independent
+instances. Every generated workflow changes, so results produced before this are
+not comparable.
 
 **2026-08 — RAM capacity model (`ram_eligibility`, `ram_capacity_norm`).** Above
 the last level a "node" is a whole region, and `generate_cloud` Dirichlet-splits

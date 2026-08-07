@@ -81,6 +81,10 @@ if __name__ == "__main__":
     #                       the nodes that can actually host each function.
     ram_eligibility=parameter_general_config.get("ram_eligibility", False)
     ram_capacity_norm=parameter_general_config.get("ram_capacity_norm", "off")
+    # Wall-clock caps per solve (seconds); None => unlimited => previous behaviour.
+    # The centralized comparison needs one when stochastic_selection is on.
+    own_time_limit=parameter_general_config.get("own_time_limit", None)
+    comparison_time_limit=parameter_general_config.get("comparison_time_limit", None)
     if ram_capacity_norm not in ("off", "l1", "l2"):
         raise SystemExit(f'ram_capacity_norm must be "off", "l1" or "l2" '
                          f'(got {ram_capacity_norm!r})')
@@ -112,6 +116,7 @@ if __name__ == "__main__":
     # load the deployment configuration
     t1=time.time()
     comp_time=[]
+    own_mipgap=[]
     # ---- Decomposed solution: workflows are placed one after the other, each
     # one solved top-down through the hierarchy (level k=0 first). num_prob is
     # the running subproblem index used in all file names.
@@ -178,7 +183,7 @@ if __name__ == "__main__":
                 # Solve the regional placement subproblem (Eq. (1)) with Gurobi
                 # and store all solution matrices and model parameters as JSON
                 # so that selection_simulation.py can re-evaluate the costs.
-                model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M=solve_opt(requirements_workflow_config,requirements_cloud_config,gap=own_gap,w_1=w_1,w_2=w_2,w_3=w_3,provider_name_list=provider_list,provider_cost_list=provider_cost_list,relax_selection=stochastic_selection,ram_eligibility=ram_eligibility,ram_capacity_norm=ram_capacity_norm)
+                model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M=solve_opt(requirements_workflow_config,requirements_cloud_config,gap=own_gap,w_1=w_1,w_2=w_2,w_3=w_3,provider_name_list=provider_list,provider_cost_list=provider_cost_list,relax_selection=stochastic_selection,ram_eligibility=ram_eligibility,ram_capacity_norm=ram_capacity_norm,time_limit=own_time_limit)
                 solution=dict()
                 solution['P']=P.tolist()
                 solution['H']=H.tolist()
@@ -193,6 +198,13 @@ if __name__ == "__main__":
                 solution['Speed'] = Speed.tolist()
                 solution['S']=S.tolist()
                 comp_time[-1][-1].append(t)
+                # Optimality gap of this subproblem. Under own_time_limit a
+                # solve may return its incumbent, so record the gap to keep
+                # a non-proven decomposition visible rather than silent.
+                try:
+                    own_mipgap.append(float(model.MIPGap))
+                except Exception:
+                    own_mipgap.append(None)
                 with open(path_solution, "w") as f:
                     json.dump(solution, f, indent=4)
                 #P_list.append(P)
@@ -217,6 +229,8 @@ if __name__ == "__main__":
     if comparison:
         heuristic=parameter_general_config["heuristic"]
         comparison_time=[]
+        comparison_mipgap=[]
+        comparison_status=[]
         # Build requirements_cloud_full.json: all physical (last-level) nodes
         # with end-to-end latencies reconstructed through the hierarchy.
         generate_full_cloud(cloud_general_config,num_run,provider_cost_list,num_levels)
@@ -235,7 +249,7 @@ if __name__ == "__main__":
 
             # Stochastic selection applies to the centralized optimization only
             # (the heuristic forces a trivial one-hot H, so it is left untouched).
-            model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M = solve_opt(requirements_workflow_config, requirements_cloud_config,comparison_gap,w_1,w_2,w_3,provider_list,provider_cost_list,heuristic,relax_selection=(stochastic_selection and not heuristic),ram_eligibility=ram_eligibility,ram_capacity_norm=ram_capacity_norm)
+            model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M = solve_opt(requirements_workflow_config, requirements_cloud_config,comparison_gap,w_1,w_2,w_3,provider_list,provider_cost_list,heuristic,relax_selection=(stochastic_selection and not heuristic),ram_eligibility=ram_eligibility,ram_capacity_norm=ram_capacity_norm,time_limit=comparison_time_limit)
             solution = dict()
             solution['P'] = P.tolist()
             solution['H'] = H.tolist()
@@ -257,6 +271,14 @@ if __name__ == "__main__":
             with open(path_cloud, "w") as f:
                 json.dump(requirements_cloud_config, f, indent=4)
             comparison_time.append(t)
+            # Optimality gap actually achieved. Under a time limit the
+            # comparison is an incumbent, not a proven optimum, so record it.
+            try:
+                comparison_mipgap.append(float(model.MIPGap))
+                comparison_status.append(int(model.Status))
+            except Exception:
+                comparison_mipgap.append(None)
+                comparison_status.append(None)
             with open(path_solution, "w") as f:
                 json.dump(solution, f, indent=4)
         t2=time.time()
@@ -265,9 +287,12 @@ if __name__ == "__main__":
     # the per-subproblem Gurobi solve times of the decomposed approach,
     # comparison_time the per-workflow times of the centralized/heuristic run.
     result_dict["time_list"]=comp_time#time_list
+    result_dict["own_mipgap"]=own_mipgap
     result_dict["overall_time"]=overall_time
     if comparison:
         result_dict["comparison_time"] = comparison_time
+        result_dict["comparison_mipgap"] = comparison_mipgap
+        result_dict["comparison_status"] = comparison_status
     if not os.path.exists(os.path.join("results", f"run_{num_run}")):
         os.mkdir(os.path.join("results", f"run_{num_run}"))
     results_path = f"results/run_{num_run}/time.json"
