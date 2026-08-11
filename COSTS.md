@@ -163,7 +163,8 @@ time W itself.
 | `money_cost`, `time_cost` | layer-2 analytic, count-weighted | `results.json` |
 | `complete_time_cost` | Σ waiting (layer 3) | `results.json` |
 | same four for the comparison solution | identical formulas on `opt_<w>_full.json` | `results_comparison.json` (+ `heuristic` flag: centralized vs all-on-cloud) |
-| per-request logs, per-node RAM | layer 3 | `detailed_simulation_run_<N>.json` — holds the **comparison** run's logs when `comparison` is on (the block re-initializes them at `:1524-1545`) |
+| per-request logs, per-node RAM | layer 3 | `detailed_simulation_run_<N>.json` — the **decomposed** solution's logs, snapshotted before the comparison block re-initializes them; the comparison run's own logs go to `detailed_comparison_run_<N>.json` when `comparison` is on |
+| per-request arrival, response and waiting times per request stream | layer 3 | `latency_seeds.json`, written by `resimulate_seeds.py` from the trace above |
 
 Note the hybrid nature of `overall_cost`: its money part is analytic (layer 2,
 continuous, count-weighted) while its time part is the event simulation's

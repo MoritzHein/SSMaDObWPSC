@@ -28,6 +28,24 @@ MANIFEST = os.path.join("settings", "ram_w3_campaign.json")
 
 W3_VALUES = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
 
+# Length of the simulated arrival stream, written explicitly into every generated
+# parameter file rather than inherited from the template, because the campaign's
+# results depend on it and the value should be visible in the manifest.
+#
+# The queue does not reach a steady state at this arrival rate: waiting per
+# request keeps growing to the end of the arrival stream, roughly 2.75x faster
+# under the deterministic policy than under the stochastic one, so the cost gap
+# between the two policies is a function of this horizon and does not converge.
+# At the previous value of 200 the run was also drain-dominated - the last
+# request finished around t=370, so 44% of all requests completed after arrivals
+# had stopped. At 400 that share is down to about a third.
+#
+# simulation_time enters only selection_simulation.py and
+# evaluate_comparison_objective.py; the optimization objective uses the rates
+# lambda rather than lambda * T. Changing it therefore needs NO re-solve - it is
+# enough to re-run resimulate_seeds.py over the existing placements.
+SIMULATION_TIME = 400
+
 # The two RAM capacity models compared (see ram_capacity_model.md).
 RAM_SETTINGS = [
     {"key": "off", "label": "RAM model off (aggregate capacity)",
@@ -45,7 +63,7 @@ POLICIES = [
 # every placement is re-simulated on these request streams by
 # resimulate_seeds.py. The first entry is the baseline seed left in the
 # parameter file.
-SIMULATION_SEEDS = [42, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+SIMULATION_SEEDS = [43, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 # No early stopping: every subproblem is solved to proven optimality. The
 # template's own_gap / comparison_gap are 0 and no TimeLimit is set, so the
@@ -82,6 +100,7 @@ if __name__ == "__main__":
                 cfg["stochastic_selection"] = pol["stochastic_selection"]
                 cfg["ram_eligibility"] = ram["ram_eligibility"]
                 cfg["ram_capacity_norm"] = ram["ram_capacity_norm"]
+                cfg["simulation_time"] = SIMULATION_TIME
                 cfg["simulation_seed"] = SIMULATION_SEEDS[0]
                 if OWN_TIME_LIMIT is not None:
                     cfg["own_time_limit"] = OWN_TIME_LIMIT
@@ -110,7 +129,7 @@ if __name__ == "__main__":
         "num_levels": template["num_levels"],
         "num_workflows": template["num_workflows"],
         "seed": template["seed"],
-        "simulation_time": template["simulation_time"],
+        "simulation_time": SIMULATION_TIME,
         "w_1": template["w_1"],
         "w_2": template["w_2"],
         "runs": runs,
@@ -127,6 +146,8 @@ if __name__ == "__main__":
     print(f"  policies     : {[p['key'] for p in POLICIES]}")
     print(f"  architecture : {template['num_levels']} levels, "
           f"{template['num_workflows']} workflows, seed {template['seed']}")
+    print(f"  horizon      : simulation_time={SIMULATION_TIME} "
+          f"(template has {template['simulation_time']})")
     print(f"  solver       : own_gap={template.get('own_gap')}, "
           f"comparison_gap={template.get('comparison_gap')}, "
           f"own_time_limit={OWN_TIME_LIMIT}"

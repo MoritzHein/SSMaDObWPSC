@@ -1295,6 +1295,17 @@ if __name__ == "__main__":
         results['complete_time_cost'] = sum(sum(waiting_acc))
         results['time_cost']=time_cost_all
 
+        # Snapshot the per-request / per-node trace of OUR run before the
+        # comparison block below re-initializes request_logs, waiting_acc and
+        # per_node_util for the centralized/heuristic solution. Without this the
+        # persisted trace describes the comparison instead of the decomposed
+        # solution, which is what made every run's detailed file identical.
+        own_detailed = {
+                'per_node_utilization': per_node_util.tolist(),
+                'request_logs': request_logs,
+                'waiting_acc': waiting_acc.tolist(),
+        }
+
         # ================= Comparison run =================
         # Repeat the identical simulation (same RNG seeds, hence the same
         # request streams) for the centralized/heuristic solution stored in
@@ -2099,11 +2110,20 @@ if __name__ == "__main__":
                 json.dump(results, f, indent=4)
 
 
-        detailed = {
-                'per_node_utilization': per_node_util.tolist(),
-                'request_logs': request_logs,
-                'waiting_acc': waiting_acc.tolist()
-        }
+        # detailed_simulation_run_<N>.json always holds OUR run (own_detailed was
+        # captured before the comparison block). The comparison trace, when one
+        # was simulated, goes to a sibling file instead of overwriting it.
         detailed_path = os.path.join(results_dir, f"detailed_simulation_run_{num_run}.json")
         with open(detailed_path, 'w') as f:
-                json.dump(detailed, f, indent=2)
+                json.dump(own_detailed, f, indent=2)
+
+        if comparison:
+                comparison_detailed = {
+                        'per_node_utilization': per_node_util.tolist(),
+                        'request_logs': request_logs,
+                        'waiting_acc': waiting_acc.tolist(),
+                }
+                comparison_detailed_path = os.path.join(
+                        results_dir, f"detailed_comparison_run_{num_run}.json")
+                with open(comparison_detailed_path, 'w') as f:
+                        json.dump(comparison_detailed, f, indent=2)

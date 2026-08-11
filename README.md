@@ -145,6 +145,25 @@ This writes **`settings/parameters_300.json` ... `settings/parameters_323.json`*
 | `w_3` | 0.5, 1.0, 1.5, 2.0, 2.5, 3.0 |
 | selection policy | deterministic, stochastic (`stochastic_selection`) |
 
+The horizon is a knob of the study rather than a template inheritance:
+`SIMULATION_TIME` in `ram_w3_experiments.py` (currently **400**) is written into
+every generated parameter file and into the manifest. It matters more than it
+looks. The queue does not reach a steady state at this arrival rate — waiting per
+request keeps rising to the end of the arrival stream, about 2.75x faster under
+the deterministic policy — so the *cost gap between the policies is a function of
+the horizon* and does not converge: on the `l2`, `w_3=1.5` cell it is −0.9% at
+`simulation_time=200`, −1.6% at 400, −3.4% at 800 and −8.5% at 1600. Quote the
+horizon whenever quoting a cost difference, and prefer the horizon-independent
+backlog slope from `visualization_waiting_over_time.py` (below) for claims about
+which policy is better. The old value of 200 was additionally drain-dominated:
+the last request finished around t=370, so 44% of requests completed after
+arrivals had stopped.
+
+Because `simulation_time` enters only `selection_simulation.py` and
+`evaluate_comparison_objective.py` — the optimization objective uses the rates
+`lambda`, not `lambda * T` — changing it needs **no re-solve**. Regenerate the
+parameter files and re-run `resimulate_seeds.py` over the existing placements.
+
 with the run number of a cell given by
 `300 + ram_index*12 + w3_index*2 + policy_index` — runs 300-311 are the
 RAM-model-off half and 312-323 the `l2` half. Nothing downstream hard-codes that
@@ -161,7 +180,19 @@ which solves and simulates all 24 runs and then calls
 to re-simulate every placement on ten independent request streams *without*
 re-solving (a single simulation at `simulation_time=200` carries roughly 10%
 Monte-Carlo noise, which is larger than several of the effects being compared).
-The per-stream costs land in `results/run_N/results_seeds.json`.
+The per-stream costs land in `results/run_N/results_seeds.json` and the
+per-request response and waiting times of the same streams in
+`results/run_N/latency_seeds.json`.
+
+The seeds are what makes the policy comparison work. Both policies are simulated
+on the *same* request streams — `selection_simulation.py` draws the Poisson
+arrivals from `rng` and the per-request deployment from a separate `rng_sel`
+precisely so the arrival stream is unaffected by the policy — so the comparison
+is paired and the per-stream *difference* is the statistic with the small
+variance. Its confidence interval is roughly four times narrower than the
+interval on either policy alone, which matters because the policy effect
+(2-3% of the overall cost) is smaller than the Monte-Carlo spread of a single
+configuration (~6%).
 
 No solver parameter needs to be touched: the generated files inherit
 `own_gap = 0` and `comparison_gap = 0` from the template and set no time limit,
@@ -178,13 +209,53 @@ To generate the figure run
 
 ```visualization_ram_w3.py```
 
-which saves `ram_w3_comparison.pdf/.png` to `results/run_300/`: two subplots
-sharing a y-axis (RAM model off on top, eligibility + l2 below), `w_3` on the
-x-axis, and a deterministic/stochastic bar pair per weight. Each bar is stacked
-into `w_1*M + w_2*B + w_2*W` (monetary, basic time, waiting), so its height is
-the overall cost; the measured `overall_cost` is drawn as a separate marker with
-a 95% confidence interval over the request streams. The script also prints the
-numbers behind the figure.
+which saves two figures to `results/run_300/`.
+
+`ram_w3_comparison.pdf/.png` has four rows, an absolute-cost row and a
+difference row per RAM capacity model (off on top, eligibility + l2 below), with
+`w_3` on the x-axis. In an absolute row each `w_3` carries a deterministic and a
+stochastic bar, stacked into `w_1*M + w_2*B + w_2*W` (monetary, basic time,
+waiting) so its height is the overall cost; the measured `overall_cost` is drawn
+as a separate marker with a 95% confidence interval over the request streams.
+The difference row below plots the *paired* difference stochastic − deterministic
+for the same cells, decomposed into the same three contributions, with the paired
+95% confidence interval of the overall cost and each cell's relative effect and
+seeds-won count. Error bars therefore mean different things in the two kinds of
+row — unpaired CI of one configuration above, paired CI of the difference below —
+and only the lower one resolves the policy effect.
+
+`ram_w3_latency.pdf/.png` shows the mechanism: the response-time CDF of one
+representative cell (`--cell=l2,1.5` by default), deterministic against
+stochastic, pooled over all request streams, plus its p50/p90/p95/p99 tail.
+
+The script also prints the numbers behind both figures.
+
+g) Waiting time over the course of a run
+
+```visualization_waiting_over_time.py --runs=316,317```
+
+Buckets every request by its **arrival** time and plots the mean waiting time of
+each bucket against elapsed simulation time, pooled over all request streams with
+a 95% confidence band. It answers what the cost bars cannot: a flat line means the
+queue has settled and the cost numbers measure a steady state; a rising line means
+the backlog is still building when the simulation stops, so total waiting grows
+faster than linearly in `simulation_time` and every cost number depends on the
+horizon.
+
+The fitted slope printed in the legend — seconds of waiting added per 1000 s of
+elapsed time — is the horizon-independent way to compare two policies, since it
+does not depend on where the simulation was stopped. On the standard architecture
+the deterministic policy adds about 40 s per 1000 s against about 15 s for the
+stochastic one.
+
+`--runs` takes a single run or any comma-separated list, so it draws one curve or
+overlays several; the intended use is the deterministic and stochastic run of the
+same cell. Labels come from `settings/ram_w3_campaign.json` when the runs belong
+to that campaign. `--window` sets the bucket width (default `simulation_time/8`)
+and `--export` the output folder (default `results/run_<first run>`). Without a
+`latency_seeds.json` it falls back to the single baseline stream, which is noisy
+enough to show a dip that looks like the queue recovering — run
+`resimulate_seeds.py` first.
 
 ## Optional model flags
 
@@ -203,7 +274,8 @@ Note on comparing runs: the placement problem is a nonconvex MIQCQP solved to
 `MIPGap 0`, and when several placements attain the same optimum the one Gurobi
 returns is arbitrary. Re-solving the *identical* model under different Gurobi
 `Seed` values moved the simulated cost by up to 236 on `run_141` and 1347 (9.3%)
-on `run_140`. Differences below that scale between two model variants are not
+on `run_140`. However, this is mostly important when w_3=0.
+Differences below that scale between two model variants are not
 evidence; compare objective values or seed-replicated ranges instead.
 
 ## Changelog / reproducibility notes

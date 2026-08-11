@@ -227,11 +227,28 @@ def update_requirements_config(requirements_workflow_config, P,H, current_node,c
         # function_set[m] = deployments whose function m was NOT placed on this
         # region's head node, i.e. it runs in another region and only appears
         # here virtually (communication enters through the head node).
+        #
+        # current_node == 0 needs one extra test. Node 0 of the parent region is
+        # its head, and Eq. (3) pins every function that lives OUTSIDE the parent
+        # region to it. Those pins are placeholders, not executions. When the
+        # head node is itself refined -- which only happens from three levels on
+        # -- P[.,0] == 1 must therefore not be read as "the parent placed it
+        # here"; the function is still outside and stays virtual. Without this
+        # the child region is asked to execute a function that lives elsewhere,
+        # which double-counts its load and, once the RAM eligibility constraint
+        # is active, makes the subproblem infeasible whenever no device of the
+        # child region is large enough to host it.
+        parent_virtual = {}
+        if current_node == 0 and parent_workflow_config is not None:
+            for m in range(num_functions):
+                parent_virtual[m] = set(
+                    parent_workflow_config["functions"][f"function_{m}"].get("function_set", []))
         for m in range(num_functions):
             liste = []
+            outside = parent_virtual.get(m, set())
             for n in range(num_workflows):
                 num = loc[n_list[n]]
-                if P[num * num_functions + m, current_node] == 0:
+                if P[num * num_functions + m, current_node] == 0 or num in outside:
                     liste.append(n)
             requirements_workflow_config["functions"][f"function_{m}"]["function_set"] = liste
     for m in range(num_functions):
@@ -543,6 +560,14 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
             cloud_name = f"requirements_cloud_{k}_{0}.json"
             path = os.path.join(f"cloud/run_{num_run}", cloud_name)
             speedup_list.append([np.random.uniform(speedup_min, speedup_max) for k in range(num_nodes)])
+            # Node 0 of level 0 is the root head node. It is not a leaf and
+            # request_list[0][0] is 0, so it originates no requests and its rate
+            # has to say so. Both draws are kept, in the order in which they used
+            # to be evaluated inside the config below, so that the RNG stream and
+            # with it the rest of the architecture is unchanged.
+            root_max_ram = np.random.uniform(ram_min, ram_max)
+            np.random.uniform(user_request_rate_min, user_request_rate_max)
+            root_request_rate = 0.0
             # var_prob=np.random.choice(0,1,p=[0.2])
             config = {
                 "name": f"cloud_{k}_{0}",
@@ -553,8 +578,8 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
                         "name": provider_list[0][0],
                         "leave": leave_list[0][0],
                         "estimated_latency": list(L[0, :]),
-                        "max_RAM_curr": np.random.uniform(ram_min,ram_max),#np.inf,
-                        "request_rate": np.random.uniform(user_request_rate_min,user_request_rate_max),
+                        "max_RAM_curr": root_max_ram,#np.inf,
+                        "request_rate": root_request_rate,
                         "utilization":0,
                         "speedup":speedup_list[-1][0],
                         "pricing_Storage_Transfer": provider_cost_list[provider_list[0][0]]["pricing_Storage_Transfer"],
@@ -571,7 +596,15 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
                 #var_prob = np.random.choice(2, 1, p=[0, 1.0])[0]
                 name_list[0].append("tinyfaas")
                 #if var_prob == 0:
-                request_list[0].append(np.random.uniform(user_request_rate_min,user_request_rate_max))
+                # Requests originate at user leaves, which are the edge nodes.
+                # A rate parked on a cloud node is never simulated (the flattened
+                # config below marks only tinyfaas nodes as leaves, and
+                # selection_simulation samples arrivals from those), so drawing
+                # one there would inflate every outside-demand placeholder below.
+                # The draw itself is kept so the RNG stream, and with it the rest
+                # of the generated architecture, is unchanged.
+                rate = np.random.uniform(user_request_rate_min,user_request_rate_max)
+                request_list[0].append(rate if provider_list[0][s + 1] == "tinyfaas" else 0.0)
                 ram_list[0].append(np.random.uniform(ram_min,ram_max))#np.inf)
                 #else:
                 #    ram_list[0].append(np.random.uniform(2000, 10000))
@@ -623,7 +656,15 @@ def generate_cloud(num_levels=2, num_run=0,provider_name=["aws","google", "tinyf
                 # Split the parent's RAM budget and request rate randomly among
                 # the region's nodes (Dirichlet keeps the totals constant);
                 # cloud regions (infinite RAM) generate no user requests.
-                request_overall = sum(request_list[-2])
+                # Outside demand of this region: everything that originates
+                # anywhere in the architecture minus what originates in the
+                # region itself (Eq. (8)). request_list holds the uninflated
+                # per-node rates, so the placeholder never compounds down the
+                # levels, and by Eq. (3) its sum is the same at every level.
+                # Subtracting the region's own share is what makes this the
+                # demand that actually reaches the region from outside; without
+                # it the head node was weighted by the whole architecture.
+                request_overall = sum(request_list[-2]) - request_list[-2][m]
                 if ram_list[-2][m] == np.inf:
                     ram = [np.inf for k in range(num_nodes)]
                     request=[0 for k in range(num_nodes)]

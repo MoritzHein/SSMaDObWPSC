@@ -1,7 +1,7 @@
 {
     "num_levels": 2,
     "num_workflows": 10,
-    "seed": 42,
+    "seed": 43,
     "w_1": 0.5,
     "w_2": 0.5,
     "w_3": 5,
