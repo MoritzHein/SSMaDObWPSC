@@ -17,7 +17,7 @@
 # The absolute rows stack every bar into the three weighted cost contributions
 #
 #     w_1 * money_cost   +   w_2 * time_cost   +   w_2 * complete_time_cost
-#     (monetary M)           (basic time B)        (waiting time W)
+#     (monetary Z)           (basic time B)        (waiting time W)
 #
 # so a bar's height is the overall cost and all four requested quantities are
 # visible at once. The stack is only ALMOST the reported overall_cost: the
@@ -76,7 +76,7 @@ except Exception:
 DEFAULT_MANIFEST = os.path.join("settings", "ram_w3_campaign.json")
 
 COMPONENTS = [
-    ("money_cost", "$w_1 M$ (monetary)", "C0"),
+    ("money_cost", "$w_1 Z$ (monetary)", "C0"),
     ("time_cost", "$w_2 B$ (basic time)", "C1"),
     ("complete_time_cost", "$w_2 W$ (waiting)", "C2"),
 ]
@@ -414,8 +414,8 @@ def paper_cost_figure(man, cell, export_path):
     policies = man["policies"]
     weight = {"money_cost": w1, "time_cost": w2, "complete_time_cost": w2}
 
-    fig, axes = plt.subplots(2, len(ram_settings), figsize=(7.15, 4.35),
-                             gridspec_kw={"height_ratios": [2.1, 1.0]},
+    fig, axes = plt.subplots(2, len(ram_settings), figsize=(7.15, 3.5),# 4.35),
+                             gridspec_kw={"height_ratios": [1.75, 1.0]},# [2.1, 1.0]},
                              sharex="col")
     axes = np.atleast_2d(axes)
     x = np.arange(len(w3_values), dtype=float)
@@ -490,9 +490,10 @@ def paper_cost_figure(man, cell, export_path):
     hi = max(a.get_ylim()[1] for a in axes[0])
     for a in axes[0]:
         a.set_ylim(lo, hi)
-    for a in axes[0][1:]:
-        a.set_yticklabels([])
-    axes[0][0].set_ylabel("overall cost $C$")
+    #for a in axes[0][1:]:
+        #a.set_yticklabels([])
+        a.set_ylabel("overall cost $C$")
+    #axes[0][0].set_ylabel("overall cost $C$")
     for a in axes[1]:
         a.set_ylabel("$\\Delta C$")
 

@@ -280,6 +280,55 @@ evidence; compare objective values or seed-replicated ranges instead.
 
 ## Changelog / reproducibility notes
 
+**2026-08 — the head node's outside-demand placeholder (Eq. (8)).** Two defects
+made the placeholder that `generate_cloud` writes into every region's head node
+much larger than the demand that actually reaches the region from outside.
+(A) `request_overall = sum(request_list[-2])` summed the whole previous level and
+was **never reduced by the region's own demand**, so it was identical for every
+region: on `run_316` all four regions carry the placeholder 0.1205211843 although
+their own rates are 0, 0.03509, 0.04733 and 0.03810, and the three-level
+`run_332` shows that one value across every region of every level. (B) that sum
+also counted rates parked on nodes that are not user leaves — `request_list[0]`
+was `[0, 0.03509 (google), 0.04733, 0.03810]` = 0.12052, but only tinyfaas leaves
+originate simulated requests, so the demand that exists is 0.08543. The latter is
+the value that reproduces the paper's own figure, 0.08543 × 400 s × 10 workflows
+= 342 requests. Together the head of region `1_2` was weighted 0.12071 in a
+deterministic subproblem where the correct weight is 0.00019 + 0.03810 = 0.03829,
+a factor 3.15.
+
+Only the deterministic path was affected. The stochastic decomposition already
+used the right quantity, since `own_head` is `request_rate - virtual_request_rate`
+and the external stream is weighted by `outside_rate` from
+`_stochastic_selection_targets`, and both are invariant under the fix. The
+flattened (centralized) config carries no placeholder, and the top-level problem
+has none either.
+
+Fixed by three edits in `cloud_workflow_setup.py`: a request rate is drawn only
+for tinyfaas nodes at level 0; the level-0 root head node is given rate 0 to agree
+with `request_list[0][0]`; and `request_overall` becomes
+`sum(request_list[-2]) - request_list[-2][m]`. All `np.random.uniform` draws are
+kept, in their original evaluation order, so the RNG stream and the rest of the
+generated architecture are unchanged — a field-by-field config diff shows only
+`request_rate`, `virtual_request_rate` and `utilization` moving.
+
+Verified on scratch runs at two and three levels. Every region's placeholder now
+equals both Λ − (own demand) and the recursion used by the stochastic path, 4
+regions on two levels and 44 on three, zero mismatches; Λ = 0.08543276 is
+identical at every level and equal to the total rate of the leaves the simulator
+samples; the head weight of region `1_2` is 0.03829309 = 0.00019330 + 0.03809979;
+and no `flow conservation skipped` warning appears. The self-check to keep is that
+`virtual_request_rate` must equal `outside_rate` for every region, because the
+recursion telescopes to Λ − λ_{l-1,m}.
+
+Impact on stored results is small but non-zero. The stochastic runs are
+bit-identical. Of the deterministic cells re-solved, the aggregate-capacity
+w_3 = 0.5 cell reproduces `run_300` exactly and the eligibility w_3 = 1.5 cell
+moves from 33108.05 to 33109.05 (+0.003%, entirely in `time_cost`, money and
+waiting unchanged). Every deterministic result and every det-vs-stoch or
+dec-vs-cen comparison should nevertheless be regenerated. Eq. (8) of the paper was
+restated accordingly, with the originating demand and the outside rate as separate
+symbols so that the placeholder can no longer be confused with a node's own rate.
+
 **2026-08 — the `seed` in parameters_N.json now reaches the architecture.**
 `generate_cloud` accepted a `seed` argument but opened with a hard-coded
 `np.random.seed(42)`, so **every run produced the byte-identical architecture no

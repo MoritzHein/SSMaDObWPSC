@@ -15,19 +15,135 @@
 ::
 :: PY points at the checkout's virtual environment; adapt it to your own setup
 :: (the older batch files in this repo hard-code an absolute anaconda path).
+::
+:: ---------------------------------------------------------------------------
+:: PARALLELISM
+::
+:: The study splits into two phases, because only one of them may be run
+:: concurrently:
+::
+::   Phase 1, placement - SEQUENTIAL. Every solve is timed and the times land in
+::   results/run_<N>/time.json. Concurrent Gurobi solves compete for the same
+::   cores, so the recorded times would no longer be solution times of the
+::   method. This campaign reports no timing table, but the other two do and
+::   they share this structure, so the rule is kept everywhere.
+::
+::   Phase 2, simulation - PARALLEL. selection_simulation.py is single threaded
+::   and every run touches only its own parameter, result and placement files -
+::   the split that resimulate_seeds.py documents under --runs - so one worker
+::   process per run is safe. Each worker simulates its run's baseline stream
+::   and then its ten request streams, which is what puts the streams of the
+::   24 runs on the machine's cores instead of running them one after another.
+::
+:: MAXJOBS caps the number of concurrent workers (default 12), e.g.
+::     set MAXJOBS=24 & run_ram_w3_study.bat
+:: MAXJOBS=1 reproduces the old, fully sequential behaviour. Per-run logs go to
+:: logs\ram_w3\run_<N>.log and each worker's exit code to run_<N>.done.
+:: ---------------------------------------------------------------------------
 @echo off
-setlocal
-set PY=.optifaasvenv\Scripts\python.exe
+setlocal enabledelayedexpansion
 
-for /l %%x in (300, 1, 323) do (
-    echo === run %%x ===
+set PY=.optifaasvenv\Scripts\python.exe
+set PINGEXE=%SystemRoot%\System32\ping.exe
+set SEEDS=10
+set LOGDIR=logs\ram_w3
+set FIRST=300
+set LAST=323
+set SIMRUNS=300 301 302 303 304 305 306 307 308 309 310 311 312 313 314 315 316 317 318 319 320 321 322 323
+if "%MAXJOBS%"=="" set MAXJOBS=12
+
+:: Re-entry point: the parallel phase starts copies of this file as workers.
+if /i "%~1"=="--worker" goto worker
+
+if not exist "%LOGDIR%" mkdir "%LOGDIR%"
+del /q "%LOGDIR%\*.done" 2>nul
+del /q "%LOGDIR%\*.started" 2>nul
+del /q "%LOGDIR%\*.log" 2>nul
+
+echo ============================================================
+echo Phase 1/2: placement, runs %FIRST%..%LAST% (sequential, solves are timed)
+echo ============================================================
+for /l %%x in (%FIRST%, 1, %LAST%) do (
+    echo === placement run %%x ===
     %PY% placement.py --num_run=%%x
-    %PY% selection_simulation.py --num_run=%%x
+    if errorlevel 1 echo *** placement run %%x FAILED
 )
 
-%PY% resimulate_seeds.py --seeds=10
+echo.
+echo ============================================================
+echo Phase 2/2: simulation on %SEEDS% request streams, up to %MAXJOBS% runs at a time
+echo ============================================================
+for %%x in (%SIMRUNS%) do (
+    call :throttle
+    echo === starting simulation worker for run %%x ===
+    type nul > "%LOGDIR%\run_%%x.started"
+    start "sim %%x" /B cmd /c ""%~f0" --worker %%x"
+)
+call :waitall
+call :report
 
 echo.
 echo Study complete. Draw the figure with:
 echo     %PY% visualization_ram_w3.py
 endlocal
+goto :eof
+
+:: ---------------------------------------------------------------------------
+:: One worker: baseline simulation of a single run, then its request streams.
+:worker
+set RUN=%~2
+%PY% selection_simulation.py --num_run=%RUN% > "%LOGDIR%\run_%RUN%.log" 2>&1
+if errorlevel 1 (
+    echo *** baseline simulation failed >> "%LOGDIR%\run_%RUN%.log"
+    >"%LOGDIR%\run_%RUN%.done" echo EXIT=1
+    goto :eof
+)
+%PY% resimulate_seeds.py --seeds=%SEEDS% --runs=%RUN% >> "%LOGDIR%\run_%RUN%.log" 2>&1
+>"%LOGDIR%\run_%RUN%.done" echo EXIT=%errorlevel%
+goto :eof
+
+:: Sleep %1 seconds. timeout.exe refuses to run with redirected stdin, which is
+:: what happens when this file is started from a non-interactive shell.
+:sleep
+set /a _pings=%~1+1
+%PINGEXE% -n !_pings! 127.0.0.1 >nul 2>&1
+goto :eof
+
+:: Block until fewer than MAXJOBS workers are outstanding.
+:throttle
+set /a running=0
+for %%r in (%SIMRUNS%) do (
+    if exist "%LOGDIR%\run_%%r.started" if not exist "%LOGDIR%\run_%%r.done" set /a running+=1
+)
+if !running! geq %MAXJOBS% (
+    call :sleep 5
+    goto throttle
+)
+goto :eof
+
+:: Block until every worker has written its sentinel.
+:waitall
+set /a left=0
+for %%r in (%SIMRUNS%) do (
+    if not exist "%LOGDIR%\run_%%r.done" set /a left+=1
+)
+if !left! gtr 0 (
+    call :sleep 15
+    goto waitall
+)
+goto :eof
+
+:: Report any worker that did not exit cleanly.
+:report
+echo.
+echo --- workers that did not exit cleanly ---
+set /a bad=0
+for %%r in (%SIMRUNS%) do (
+    set /p code=<"%LOGDIR%\run_%%r.done"
+    if not "!code!"=="EXIT=0" (
+        echo   run %%r: !code!  see %LOGDIR%\run_%%r.log
+        set /a bad+=1
+    )
+)
+if !bad!==0 echo   none - all %SEEDS%-stream simulations completed
+goto :eof
