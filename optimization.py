@@ -14,8 +14,186 @@ import os
 from typing import Any, Dict
 import time
 
+
 # %%
-def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, Any], gap=0,w_1=1,w_2=1,w_3=1,provider_name_list=[],provider_cost_list=[],heuristic=False,relax_selection=False,ram_eligibility=False,ram_capacity_norm="off",time_limit=None):
+# ---- Model-free comparison baselines --------------------------------------
+#
+# The comparison run evaluates the same architecture under a placement that was
+# not obtained from the MINLP. Historically that was "all_cloud": every function
+# of every deployment on node 0 and every leaf on deployment 0. That baseline is
+# weak in a specific way - since all leaves select the same deployment and all of
+# its functions share one node, the whole architecture's traffic for a workflow
+# serialises through a single function instance under the simulator's
+# one-request-per-(node, workflow, deployment, function) rule. The alternatives
+# below are the heuristic class the introduction points at (XFaaS, ECO) and the
+# random and greedy references a reader expects to see.
+#
+# Every baseline only has to fill P (one node per (deployment, function)) and a
+# binary H (one deployment per leaf); nothing is solved.
+HEURISTIC_MODES = ("all_cloud", "all_cloud_rr", "local_first", "greedy_cost",
+                   "best_fit_edge", "random_feasible")
+
+
+def _eligible_nodes(ctx, m):
+    """Nodes whose largest physical device can host function m (Eq. (16))."""
+    return [i for i in range(ctx["num_nodes"])
+            if ctx["ram_max_node"][i] >= ctx["ram"][m]]
+
+
+def _cheapest_cloud(ctx, m):
+    """Cheapest non-edge node for function m; node 0 if there is none."""
+    cloud = [i for i in range(ctx["num_nodes"]) if not ctx["is_edge"][i]]
+    if not cloud:
+        return 0
+    return min(cloud, key=lambda i: ctx["C"][m][i])
+
+
+def _round_robin_H(ctx, H):
+    """Spread the leaves over the deployments.
+
+    Sending every leaf to one deployment is what makes all_cloud degenerate, so
+    every other baseline distributes them instead.
+    """
+    n_dep = ctx["n_dep"]
+    for k in range(ctx["num_leaves"]):
+        H[k, k % n_dep] = 1
+
+
+def _place_all_cloud(ctx, P, H, rr=False):
+    for l in range(len(P)):
+        P[l, 0] = 1
+    if rr:
+        _round_robin_H(ctx, H)
+    else:
+        for l in range(len(H)):
+            H[l, 0] = 1
+
+
+def _place_local_first(ctx, P, H):
+    """Each deployment is hosted on one edge node as far as its memory allows.
+
+    The edge-first strategy of platforms that keep computation next to the user
+    and spill to the cloud only what does not fit.
+    """
+    F, n_dep = ctx["num_functions"], ctx["n_dep"]
+    edges = [i for i in range(ctx["num_nodes"]) if ctx["is_edge"][i]]
+    for n in range(n_dep):
+        home = edges[n % len(edges)] if edges else 0
+        budget = ctx["ram_max"][home]
+        for m in range(F):
+            if ctx["ram"][m] <= ctx["ram_max_node"][home] and ctx["ram"][m] <= budget:
+                P[m + n * F, home] = 1
+                budget -= ctx["ram"][m]
+            else:
+                P[m + n * F, _cheapest_cloud(ctx, m)] = 1
+    _round_robin_H(ctx, H)
+
+
+def _place_best_fit_edge(ctx, P, H):
+    """Bin-pack the functions onto the smallest edge device that still fits.
+
+    Largest function first, which is the usual best-fit-decreasing order, and
+    whatever no edge device can take goes to the cheapest cloud node.
+    """
+    F, n_dep = ctx["num_functions"], ctx["n_dep"]
+    budget = {i: ctx["ram_max"][i] for i in range(ctx["num_nodes"]) if ctx["is_edge"][i]}
+    order = sorted(((n, m) for n in range(n_dep) for m in range(F)),
+                   key=lambda nm: -ctx["ram"][nm[1]])
+    for n, m in order:
+        fits = [i for i, left in budget.items()
+                if left >= ctx["ram"][m] and ctx["ram_max_node"][i] >= ctx["ram"][m]]
+        if fits:
+            best = min(fits, key=lambda i: budget[i])
+            P[m + n * F, best] = 1
+            budget[best] -= ctx["ram"][m]
+        else:
+            P[m + n * F, _cheapest_cloud(ctx, m)] = 1
+    _round_robin_H(ctx, H)
+
+
+def _place_greedy_cost(ctx, P, H):
+    """Walk each branch and take the locally cheapest eligible node.
+
+    Scores a node by the same terms the objective charges for one execution -
+    its monetary cost, its runtime and the latency from the predecessor's node -
+    without any of the lookahead the MINLP has. This is the greedy reference.
+    """
+    F, n_dep = ctx["num_functions"], ctx["n_dep"]
+    w_1, w_2 = ctx["w_1"], ctx["w_2"]
+    C, L, Speed, Time = ctx["C"], ctx["L"], ctx["Speed"], ctx["Time"]
+    for n in range(n_dep):
+        home = ctx["leave_nodes"][n % len(ctx["leave_nodes"])] if ctx["leave_nodes"] else 0
+        placed = {}
+        for path in ctx["paths"]:
+            prev = home
+            for m in path:
+                if m in placed:
+                    prev = placed[m]
+                    continue
+                cand = _eligible_nodes(ctx, m) or [_cheapest_cloud(ctx, m)]
+                best = min(cand, key=lambda i: (w_1 * C[m][i]
+                                                + w_2 * (Speed[m][i] * Time[m] + L[prev][i])))
+                placed[m] = best
+                P[m + n * F, best] = 1
+                prev = best
+        for m in range(F):
+            if m not in placed:
+                cand = _eligible_nodes(ctx, m) or [_cheapest_cloud(ctx, m)]
+                best = min(cand, key=lambda i: w_1 * C[m][i] + w_2 * Speed[m][i] * Time[m])
+                placed[m] = best
+                P[m + n * F, best] = 1
+    # Every leaf takes the deployment whose entry and exit sit closest to it.
+    starts = [ctx["paths"][0][0] if ctx["paths"] else 0]
+    ends = [ctx["paths"][0][-1] if ctx["paths"] else 0]
+    for k in range(ctx["num_leaves"]):
+        node_k = ctx["leave_nodes"][k]
+
+        def round_trip(n):
+            first = int(np.argmax(P[starts[0] + n * F]))
+            last = int(np.argmax(P[ends[0] + n * F]))
+            # Ties are broken round-robin. Without it every leaf takes
+            # deployment 0 whenever the deployments are placed alike, which
+            # funnels the whole architecture through one function instance and
+            # makes the baseline lose for a reason that has nothing to do with
+            # the placement it computed.
+            return (L[node_k][first] + L[last][node_k], (n - k) % n_dep)
+
+        H[k, min(range(n_dep), key=round_trip)] = 1
+
+
+def _place_random_feasible(ctx, P, H):
+    """Uniform over the eligible nodes; the random reference, seeded."""
+    rng = np.random.default_rng(ctx["seed"])
+    F, n_dep = ctx["num_functions"], ctx["n_dep"]
+    for n in range(n_dep):
+        for m in range(F):
+            cand = _eligible_nodes(ctx, m) or [_cheapest_cloud(ctx, m)]
+            P[m + n * F, cand[int(rng.integers(len(cand)))]] = 1
+    for k in range(ctx["num_leaves"]):
+        H[k, int(rng.integers(n_dep))] = 1
+
+
+def heuristic_placement(mode, ctx, P, H):
+    """Fill P and H with the requested model-free baseline."""
+    if mode in (None, True, "all_cloud"):
+        _place_all_cloud(ctx, P, H)
+    elif mode == "all_cloud_rr":
+        _place_all_cloud(ctx, P, H, rr=True)
+    elif mode == "local_first":
+        _place_local_first(ctx, P, H)
+    elif mode == "best_fit_edge":
+        _place_best_fit_edge(ctx, P, H)
+    elif mode == "greedy_cost":
+        _place_greedy_cost(ctx, P, H)
+    elif mode == "random_feasible":
+        _place_random_feasible(ctx, P, H)
+    else:
+        raise ValueError("comparison_mode must be one of %s (got %r)"
+                         % (("centralized",) + HEURISTIC_MODES, mode))
+
+
+# %%
+def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, Any], gap=0,w_1=1,w_2=1,w_3=1,provider_name_list=[],provider_cost_list=[],heuristic=False,relax_selection=False,ram_eligibility=False,ram_capacity_norm="off",time_limit=None,comparison_mode=None):
     """Solve the placement + selection problem (Eq. (1) of the paper) with Gurobi.
 
     Parameters
@@ -277,9 +455,11 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
     #w_2=1
     #w_3=1
     if heuristic:
-        # Baseline heuristic (Sec. IV-C): place every function of every
-        # deployment on node 0 (the first cloud provider) and let every leaf
-        # select the first deployment. No optimization is solved.
+        # Model-free comparison baseline. The default, "all_cloud", is the one
+        # of the previous studies: every function of every deployment on node 0
+        # (the first cloud provider) and every leaf on the first deployment.
+        # comparison_mode selects one of the alternatives in HEURISTIC_MODES.
+        # No optimization is solved in any of them.
         t1=time.time()
         P_list = []
         # for model in  model_list:
@@ -291,10 +471,27 @@ def solve_opt(deployment_workflow: Dict[str, Any],deployment_cloud: Dict[str, An
         M=np.zeros((num_nodes,1))
         p = np.zeros((num_workflows,num_functions))
 
-        for l in range(len(P)):
-            P[l,0]=1
-        for l in range(len(H)):
-            H[l,0]=1
+        func_names = list(deployment_workflow['functions'])
+        ctx = {
+            "num_functions": num_functions,
+            "n_dep": num_workflows,          # rows of P are flattened as m + n*F
+            "num_nodes": num_nodes,
+            "num_leaves": num_leaves,
+            "C": C, "L": L, "Speed": Speed, "Time": [float(x) for x in Time],
+            "ram": [float(x) for x in ram],
+            "ram_max": [float(ram_max[i][0]) for i in range(num_nodes)],
+            "ram_max_node": ram_max_node,
+            "is_edge": [deployment_cloud['providers'][f"provider_{i}"]["name"] == 'tinyfaas'
+                        for i in range(num_nodes)],
+            "leave_nodes": list(leave_nodes),
+            "paths": [[func_names.index(f"function_{f}")
+                       for f in deployment_workflow['paths'][str(s)]]
+                      for s in range(num_paths)],
+            "w_1": w_1, "w_2": w_2,
+            # A random baseline still has to be reproducible across re-runs.
+            "seed": 42,
+        }
+        heuristic_placement(comparison_mode, ctx, P, H)
         t2=time.time()
         t=t2-t1
 

@@ -227,7 +227,15 @@ if __name__ == "__main__":
     # flattened architecture containing every physical node, either with the
     # centralized optimization or with the all-on-provider-1 heuristic.
     if comparison:
-        heuristic=parameter_general_config["heuristic"]
+        # "comparison_mode" selects what the comparison run is: "centralized"
+        # solves the MINLP on the flattened architecture, any other value names
+        # a model-free baseline from optimization.HEURISTIC_MODES. The older
+        # boolean "heuristic" stays valid and maps to centralized / all_cloud,
+        # so the earlier campaigns reproduce unchanged.
+        comparison_mode=parameter_general_config.get("comparison_mode")
+        if comparison_mode is None:
+            comparison_mode="all_cloud" if parameter_general_config["heuristic"] else "centralized"
+        heuristic=(comparison_mode!="centralized")
         comparison_time=[]
         comparison_mipgap=[]
         comparison_status=[]
@@ -249,7 +257,7 @@ if __name__ == "__main__":
 
             # Stochastic selection applies to the centralized optimization only
             # (the heuristic forces a trivial one-hot H, so it is left untouched).
-            model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M = solve_opt(requirements_workflow_config, requirements_cloud_config,comparison_gap,w_1,w_2,w_3,provider_list,provider_cost_list,heuristic,relax_selection=(stochastic_selection and not heuristic),ram_eligibility=ram_eligibility,ram_capacity_norm=ram_capacity_norm,time_limit=comparison_time_limit)
+            model,P,H,L,T,C,D,D_in,Time,a,b,Speed,S,t,M = solve_opt(requirements_workflow_config, requirements_cloud_config,comparison_gap,w_1,w_2,w_3,provider_list,provider_cost_list,heuristic,relax_selection=(stochastic_selection and not heuristic),ram_eligibility=ram_eligibility,ram_capacity_norm=ram_capacity_norm,time_limit=comparison_time_limit,comparison_mode=comparison_mode)
             solution = dict()
             solution['P'] = P.tolist()
             solution['H'] = H.tolist()

@@ -269,6 +269,61 @@ different settings.
 | `stochastic_selection` | `true` / `false` | `false` | Relaxes the selection `H_{k,n}` from a one-hot choice to a stochastic routing policy in `[0,1]`, and samples each request's deployment from it during simulation. Full description in [`stochastic_selection.md`](stochastic_selection.md). |
 | `ram_eligibility` | `true` / `false` | `false` | Forbids placing a function on a node whose subtree contains no physical node large enough to host it. A necessary condition for any physical realisation, so the decomposition stays a relaxation. See [`ram_capacity_model.md`](ram_capacity_model.md). |
 | `ram_capacity_norm` | `"off"` / `"l1"` / `"l2"` | `"off"` | Capacity used to normalise the node utilization `M_i`, restricted per function to the subtree nodes that can host it. `"off"` keeps the aggregate `RAM_max,i`; `"l2"` is the value that makes an aggregated node's squared utilization match the smallest total its children can achieve. Only affects levels above the physical one. See [`ram_capacity_model.md`](ram_capacity_model.md). |
+| `selection_policy` | block, see below | absent | Blocking-aware selection. Restricts each request's draw to the deployments that could start it now. **Simulation only** — it never changes the placement, so a variant can reuse a solved run. |
+| `comparison_mode` | `"centralized"` or one of `optimization.HEURISTIC_MODES` | derived from `heuristic` | What the comparison run evaluates. `heuristic: true` maps to `"all_cloud"` and `false` to `"centralized"`, so older parameter files are unchanged. |
+
+### `selection_policy`
+
+```json
+"selection_policy": {
+    "candidates": "support_then_placed",
+    "probe":      "entry",
+    "rule":       "free_sample",
+    "instrument": false
+}
+```
+
+`candidates` is the option set: `"support"` = `{n : H_{k,n} > 0}`, `"placed"` =
+every deployment whose functions are all placed, `"support_then_placed"` widens
+beyond the support only when nothing in it is free. `rule` is one of
+`open_loop`, `free_sample`, `free_argmax_h`, `free_uniform`, `least_loaded`,
+`power_of_two`, `deficit_free`. `instrument` records how often a rule had
+anything to decide into `results.json` under `selection_stats` without changing
+the draw, so an instrumented open-loop run reproduces its plain counterpart
+bit-for-bit.
+
+Two things are worth knowing before using this:
+
+* Under a **deterministic** placement the support of `H` holds a single
+  deployment — selection is not recomputed below the top level, so a whole
+  region shares one — and every rule over `"support"` is a no-op. Runtime
+  recourse on a deterministic placement has to use `"placed"`.
+* The rules draw from `rng_sel` only, never from `rng`, so the arrival stream
+  and the paired comparison across policies are unaffected.
+
+Campaign: `policy_experiments.py` writes **runs 500–607** (2 memory models ×
+6 values of w₃ × 9 selection variants) plus **runs 620–625** (the model-free
+reference placements), and `settings/policy_campaign.json`. The policy runs clone
+`cloud/`, `workflows/` and `placement/` from the RAM × w₃ study — **nothing is
+re-solved**, which also rules out the solver returning a different optimum of
+equal objective. They set `comparison: false`, because the model-free baselines
+depend on neither w₃ nor the memory model nor the selection rule, and are
+therefore simulated once each instead of in all 108 cells.
+
+`run_policy_study.sh [MAXJOBS]` drives the whole study: generate, solve only
+620–625, simulate every run once, `resimulate_seeds.py` for the ten paired
+streams, then `visualization_policy.py --paper --latex` for the tables and the
+two figures (`policy_bars.pdf`, `policy_w3.pdf`).
+
+### Model-free comparison baselines
+
+`all_cloud` (the previous default) places every function on node 0 and sends
+every leaf to deployment 0, so the whole architecture's traffic for a workflow
+serialises through one function instance. `all_cloud_rr` keeps the placement but
+spreads the leaves; `local_first`, `best_fit_edge`, `greedy_cost` and
+`random_feasible` are the edge-first, bin-packing, greedy and random references.
+All of them honour the eligibility condition `RAM_m <= RAM^node_i` and none
+solves anything.
 
 Note on comparing runs: the placement problem is a nonconvex MIQCQP solved to
 `MIPGap 0`, and when several placements attain the same optimum the one Gurobi

@@ -102,6 +102,415 @@ def branch_functions(b, s, path_order=None):
         return [int(m) for m in order if 0 <= int(m) < len(row) and row[int(m)] == 1]
 
 
+
+
+# ---- Blocking-aware selection --------------------------------------------
+
+#
+
+# The open-loop policy samples a request's deployment from H[leaf,:] without
+
+# looking at the architecture. The rules below restrict that draw to the
+
+# deployments that could actually start the request now. They need no state of
+
+# their own: node_active[i] already holds the booked executions of node i as
+
+# (end, ram, deployment, function, workflow, start) and node_ram_max[i] the RAM
+
+# cap, so availability is decided with exactly the test the booking loop below
+
+# applies when it searches for a slot.
+
+#
+
+# A deterministic placement pins every leaf - in fact every region, since
+
+# selection is not recomputed below the top level - to a single deployment, so
+
+# the "support" candidate set leaves nothing to choose between and every rule
+
+# degenerates to open_loop. That is intended and is the point: relaxing H is
+
+# what creates the option set a state-aware rule can act on.
+
+
+
+SELECTION_POLICY_DEFAULTS = {
+
+        "candidates": "support",
+
+        "probe": "entry",
+
+        "rule": "open_loop",
+
+        "fallback": "open_loop",
+
+        "instrument": False,
+
+}
+
+
+
+CANDIDATE_SETS = ("support", "placed", "support_then_placed")
+
+SELECTION_RULES = ("open_loop", "free_sample", "free_argmax_h", "free_uniform",
+
+                   "least_loaded", "power_of_two", "deficit_free")
+
+SELECTION_PROBES = ("entry",)
+
+
+
+
+
+def normalize_selection_policy(cfg):
+
+        """Validate the parameter-file block; None keeps the open-loop policy.
+
+
+
+        Absent or null means the behavior of the previous runs, and the caller
+
+        then skips every code path added here, so their results stay
+
+        bit-for-bit reproducible. A block with rule "open_loop" and instrument
+
+        true also leaves the draw itself untouched and only records how much
+
+        room a state-aware rule would have had.
+
+        """
+
+        if not cfg:
+
+                return None
+
+        pol = dict(SELECTION_POLICY_DEFAULTS)
+
+        for key, value in cfg.items():
+
+                if key not in SELECTION_POLICY_DEFAULTS:
+
+                        raise ValueError("unknown selection_policy key " + str(key))
+
+                if value is not None:
+
+                        pol[key] = value
+
+        if pol["candidates"] not in CANDIDATE_SETS:
+
+                raise ValueError("selection_policy.candidates must be one of "
+
+                                 + str(CANDIDATE_SETS))
+
+        if pol["rule"] not in SELECTION_RULES:
+
+                raise ValueError("selection_policy.rule must be one of "
+
+                                 + str(SELECTION_RULES))
+
+        if pol["probe"] not in SELECTION_PROBES:
+
+                raise ValueError("selection_policy.probe must be one of "
+
+                                 + str(SELECTION_PROBES))
+
+        if pol["fallback"] != "open_loop":
+
+                raise ValueError("selection_policy.fallback supports only open_loop")
+
+        if pol["rule"] == "open_loop" and not pol["instrument"]:
+
+                return None
+
+        return pol
+
+
+
+
+
+def new_selection_stats():
+
+        """How often a state-aware rule had anything to decide."""
+
+        return {
+
+                'requests': 0,
+
+                'with_choice': 0,
+
+                'any_free': 0,
+
+                'all_blocked': 0,
+
+                'avoidable_block': 0,
+
+        }
+
+
+
+
+
+def entry_functions(b_mat, path_order, num_paths):
+
+        """First function of every branch - what an arriving request starts on.
+
+
+
+        Each branch of the walk below starts at the arrival time, so these are
+
+        the executions that decide whether a deployment can begin serving now.
+
+        Branches sharing their first function are deduplicated: the repeated
+
+        booking is blocked by the request itself, not by the architecture.
+
+        """
+
+        firsts = []
+
+        for s in range(num_paths):
+
+                fn = branch_functions(b_mat, s, path_order)
+
+                if fn and fn[0] not in firsts:
+
+                        firsts.append(fn[0])
+
+        return firsts
+
+
+
+
+
+def deployment_delay(plan, entries, node_active, node_ram_max, w, d, cur_t):
+
+        """0 if deployment d could start every branch now, else a wait estimate.
+
+
+
+        Mirrors the acceptance test of the booking loop: an execution occupies
+
+        its node over [start, end), the RAM of the overlapping executions plus
+
+        the request's own has to fit, and no other request may hold this
+
+        (deployment, function, workflow). When blocked, the value returned is
+
+        the time until the earliest execution that releases it ends, which is
+
+        what the least_loaded rule ranks candidates on.
+
+        """
+
+        places = plan['selected_places']
+
+        durs = plan['durations']
+
+        rams = plan['rams']
+
+        worst = 0
+
+        for m in entries:
+
+                node = places[m]
+
+                slot_end = cur_t + durs[m]
+
+                used = 0
+
+                busy_ends = []
+
+                for entry in node_active[node]:
+
+                        if entry[5] < slot_end and cur_t < entry[0]:
+
+                                used += entry[1]
+
+                                if entry[2] == d and entry[3] == m and entry[4] == w:
+
+                                        busy_ends.append(entry[0])
+
+                if not busy_ends and used + rams[m] <= node_ram_max[node]:
+
+                        continue
+
+                # Capacity and the function deployment are released only by an
+
+                # execution ending, so that is the earliest this entry can run.
+
+                ends = busy_ends if busy_ends else [e[0] for e in node_active[node]
+
+                                                    if e[0] > cur_t]
+
+                wait = int(min(ends) - cur_t) if ends else 1
+
+                worst = max(worst, wait if wait > 0 else 1)
+
+        return worst
+
+
+
+
+
+def choose_deployment(pol, dist, plans, entries, node_active, node_ram_max,
+
+                      w, cur_t, rng_sel, served, stats):
+
+        """This request's deployment under the configured selection rule.
+
+
+
+        `served` counts the requests of this (workflow, leaf) that each
+
+        deployment has already taken, which deficit_free uses to hold the
+
+        realized routing frequencies on the distribution the placement was
+
+        priced with. Every draw goes through rng_sel, so the arrival stream and
+
+        with it the paired comparison across policies stays untouched.
+
+        """
+
+        n_dep = len(dist)
+
+        support = [d for d in range(n_dep) if dist[d] > 0 and d in plans]
+
+        placed = sorted(plans)
+
+        cand = placed if pol["candidates"] == "placed" else support
+
+        delays = {d: deployment_delay(plans[d], entries, node_active,
+
+                                      node_ram_max, w, d, cur_t) for d in cand}
+
+        free = [d for d in cand if delays[d] == 0]
+
+        if not free and pol["candidates"] == "support_then_placed":
+
+                # Widen beyond what the optimizer selected only once nothing it
+
+                # selected is available, so H stays authoritative.
+
+                extra = [d for d in placed if d not in delays]
+
+                for d in extra:
+
+                        delays[d] = deployment_delay(plans[d], entries, node_active,
+
+                                                     node_ram_max, w, d, cur_t)
+
+                cand = cand + extra
+
+                free = [d for d in cand if delays[d] == 0]
+
+
+
+        stats['requests'] += 1
+
+        if len(cand) > 1:
+
+                stats['with_choice'] += 1
+
+        if free:
+
+                stats['any_free'] += 1
+
+        else:
+
+                stats['all_blocked'] += 1
+
+
+
+        rule = pol["rule"]
+
+        if rule == "open_loop":
+
+                # Left exactly as it is, so an instrumented run reproduces its
+
+                # uninstrumented counterpart bit-for-bit.
+
+                d_sel = int(rng_sel.choice(n_dep, p=dist))
+
+                if delays.get(d_sel, 0) > 0 and free:
+
+                        stats['avoidable_block'] += 1
+
+                return d_sel
+
+
+
+        if not free:
+
+                return int(rng_sel.choice(n_dep, p=dist))
+
+
+
+        if rule == "free_sample":
+
+                weights = [dist[d] for d in free]
+
+                total = sum(weights)
+
+                weights = ([x / total for x in weights] if total > 0
+
+                           else [1.0 / len(free)] * len(free))
+
+                d_sel = int(free[int(rng_sel.choice(len(free), p=weights))])
+
+        elif rule == "free_uniform":
+
+                d_sel = int(free[int(rng_sel.integers(len(free)))])
+
+        elif rule == "free_argmax_h":
+
+                best = max(dist[d] for d in free)
+
+                tied = [d for d in free if dist[d] >= best - 1e-12]
+
+                d_sel = int(tied[int(rng_sel.integers(len(tied)))])
+
+        elif rule == "least_loaded":
+
+                best = min(delays[d] for d in cand)
+
+                tied = [d for d in cand if delays[d] == best]
+
+                d_sel = int(tied[int(rng_sel.integers(len(tied)))])
+
+        elif rule == "power_of_two":
+
+                pair = [int(rng_sel.choice(n_dep, p=dist)),
+
+                        int(rng_sel.choice(n_dep, p=dist))]
+
+                known = [d for d in pair if d in delays]
+
+                d_sel = min(known, key=lambda d: delays[d]) if known else pair[0]
+
+        elif rule == "deficit_free":
+
+                # Largest shortfall against the share the placement assumed.
+
+                total = sum(served.values()) + 1
+
+                d_sel = max(free, key=lambda d: dist[d] * total - served.get(d, 0))
+
+        else:
+
+                d_sel = int(rng_sel.choice(n_dep, p=dist))
+
+
+
+        if d_sel not in plans:
+
+                return int(rng_sel.choice(n_dep, p=dist))
+
+        return int(d_sel)
+
+
 if __name__ == "__main__":
 
 
@@ -140,6 +549,14 @@ if __name__ == "__main__":
         # evaluation samples each request's deployment from the continuous policy
         # H[leaf,:] and reports a Monte-Carlo cost. Absent => off => unchanged.
         stochastic_selection=parameter_general_config.get("stochastic_selection", False)
+        # Blocking-aware selection: restrict the per-request draw to the
+        # deployments that could start it now. Absent or null keeps the
+        # open-loop policy and every code path below unchanged.
+        selection_policy = normalize_selection_policy(
+                parameter_general_config.get("selection_policy", None))
+        if selection_policy is not None and parameter_general_config.get("lazy_start", False):
+                raise ValueError("selection_policy is implemented for the default "
+                                 "scheduler only; set lazy_start to false")
         general_config_path=f"cloud/run_{num_run}/general_config.json"
         cloud_general_config = load_json_cached(general_config_path)
         num_leaves=cloud_general_config["num_leaves"]
@@ -151,6 +568,11 @@ if __name__ == "__main__":
         num_probs=0
         comparison=parameter_general_config["comparison"]
         heuristic=parameter_general_config["heuristic"]
+        # Which model-free baseline the comparison run evaluates. The older
+        # boolean maps to centralized / all_cloud, so earlier runs are unchanged.
+        comparison_mode=parameter_general_config.get("comparison_mode")
+        if comparison_mode is None:
+                comparison_mode="all_cloud" if heuristic else "centralized"
 
         time_cost_all = 0
         money_cost_all = 0
@@ -594,6 +1016,24 @@ if __name__ == "__main__":
                                         rams[m] = 0
                         return selected_places, durations, rams
 
+                # A deployment the decomposition pruned carries no 1 in its rows
+                # of P, and build_plan then resolves every one of its functions to
+                # node 0. Routing a request there would execute a plan that was
+                # never placed, so a widened candidate set may only admit a
+                # deployment whose functions are all placed.
+                def plan_is_placed(d):
+                        for m in range(num_funcs):
+                                try:
+                                        row = P[d * num_funcs + m]
+                                except Exception:
+                                        return False
+                                if not any(float(x) > 0.5 for x in row):
+                                        return False
+                        return True
+
+                widen = (selection_policy is not None
+                         and selection_policy["candidates"] != "support")
+
                 def plan_base_T(sel_places, durs, lf):
                         base_T_paths = []
                         for s in range(num_paths_w):
@@ -620,7 +1060,7 @@ if __name__ == "__main__":
                                 dist = [x / tot_p for x in dist] if tot_p > 0 else [1.0 / num_deployment] * num_deployment
                                 plans = {}
                                 for d in range(num_deployment):
-                                        if dist[d] <= 0:
+                                        if dist[d] <= 0 and not (widen and plan_is_placed(d)):
                                                 continue
                                         sp, du, rm = build_plan(d)
                                         plans[d] = {
@@ -644,11 +1084,40 @@ if __name__ == "__main__":
                                         'rams': rams,
                                         'L': L
                                 }
+                                if selection_policy is not None:
+                                        # The deterministic policy selects one deployment per
+                                        # leaf, so its support is a single point and every rule
+                                        # degenerates to open_loop. Only a widened candidate
+                                        # set gives a rule anything to decide here.
+                                        dist = [0.0] * num_deployment
+                                        dist[int(sel_work)] = 1.0
+                                        plans = {int(sel_work): {
+                                                'selected_places': selected_places,
+                                                'durations': durations,
+                                                'rams': rams,
+                                                'base_T': plan_base_T(selected_places, durations, leaf),
+                                        }}
+                                        if widen:
+                                                for d in range(num_deployment):
+                                                        if d in plans or not plan_is_placed(d):
+                                                                continue
+                                                        sp, du, rm = build_plan(d)
+                                                        plans[d] = {
+                                                                'selected_places': sp,
+                                                                'durations': du,
+                                                                'rams': rm,
+                                                                'base_T': plan_base_T(sp, du, leaf),
+                                                        }
+                                        perwf[w][leaf]['dist'] = dist
+                                        perwf[w][leaf]['plans'] = plans
 
                 perwf[w]['a'] = a
                 perwf[w]['b'] = b
                 perwf[w]['num_paths'] = num_paths_w
                 perwf[w]['path_order'] = path_order
+                # Executions an arriving request has to start on; the
+                # blocking-aware rules probe exactly these.
+                perwf[w]['entry_funcs'] = entry_functions(b, path_order, num_paths_w)
 
         # ---- Discrete-event simulation state (decomposed solution):
         # node_active[i] holds the currently running executions on node i as
@@ -677,6 +1146,7 @@ if __name__ == "__main__":
         # and per-(workflow, leaf, deployment) counters for the Monte-Carlo cost.
         rng_sel = np.random.default_rng(simulation_seed + 81)
         sel_counts = [[{} for _ in range(num_leaves)] for _ in range(num_workflows)]
+        sel_stats = new_selection_stats()
 
         # Simulate second by second: sample Poisson arrivals for every
         # (workflow, leaf) pair, then execute them under the two blocking
@@ -923,11 +1393,19 @@ if __name__ == "__main__":
                                         # the earliest time slot that satisfies the RAM and
                                         # function-busy blocking rules.
                                         for i in range(n):
-                                                if stochastic_selection:
+                                                if stochastic_selection or (
+                                                                selection_policy is not None and 'dist' in info):
                                                         # Sample this request's deployment from the leaf
                                                         # policy and use that deployment's plan/base_T.
                                                         dist = info['dist']
-                                                        d_sel = int(rng_sel.choice(len(dist), p=dist))
+                                                        if selection_policy is None:
+                                                                d_sel = int(rng_sel.choice(len(dist), p=dist))
+                                                        else:
+                                                                d_sel = choose_deployment(
+                                                                        selection_policy, dist, info['plans'],
+                                                                        perwf[w].get('entry_funcs', []), node_active,
+                                                                        node_ram_max, w, cur_t, rng_sel,
+                                                                        sel_counts[w][leaf], sel_stats)
                                                         plan = info['plans'].get(d_sel)
                                                         if plan is None:
                                                                 continue
@@ -1294,6 +1772,12 @@ if __name__ == "__main__":
         results['money_cost']=money_cost_all
         results['complete_time_cost'] = sum(sum(waiting_acc))
         results['time_cost']=time_cost_all
+        # Realized routing and how much room a blocking-aware rule had. Written
+        # unconditionally so a run can be compared against its own open-loop
+        # instrumentation without re-simulating.
+        results['selection_stats'] = sel_stats
+        results['selection_counts'] = [[dict(sel_counts[t][k]) for k in range(num_leaves)]
+                                       for t in range(num_workflows)]
 
         # Snapshot the per-request / per-node trace of OUR run before the
         # comparison block below re-initializes request_logs, waiting_acc and
@@ -1314,6 +1798,12 @@ if __name__ == "__main__":
         # the flattened architecture - no hierarchy reconstruction is needed
         # (reconstruct_full_solution only serves as fallback).
         if comparison:
+                # The comparison placement is the reference the own run is scored
+                # against, so it stays open loop unless the policy explicitly opts in.
+                selection_policy_cmp = (selection_policy
+                                        if selection_policy is not None
+                                        and selection_policy.get("apply_to_comparison")
+                                        else None)
                 np.random.seed(simulation_seed)
                 sim_time=parameter_general_config["simulation_time"]
                 time_cost_all=0
@@ -1563,6 +2053,24 @@ if __name__ == "__main__":
                                 return selected_places, durations, rams
 
                         # Ideal (blocking-free) branch time of a plan from leaf `lf`.
+                        # A deployment the decomposition pruned carries no 1 in its rows
+                        # of P, and build_plan then resolves every one of its functions to
+                        # node 0. Routing a request there would execute a plan that was
+                        # never placed, so a widened candidate set may only admit a
+                        # deployment whose functions are all placed.
+                        def plan_is_placed(d):
+                                for m in range(num_funcs):
+                                        try:
+                                                row = P[d * num_funcs + m]
+                                        except Exception:
+                                                return False
+                                        if not any(float(x) > 0.5 for x in row):
+                                                return False
+                                return True
+
+                        widen = (selection_policy_cmp is not None
+                                 and selection_policy_cmp["candidates"] != "support")
+
                         def plan_base_T(sel_places, durs, lf):
                                 base_T_paths = []
                                 for s in range(num_paths_w):
@@ -1592,7 +2100,7 @@ if __name__ == "__main__":
                                         dist = [x / tot_p for x in dist] if tot_p > 0 else [1.0 / num_deployment] * num_deployment
                                         plans = {}
                                         for d in range(num_deployment):
-                                                if dist[d] <= 0:
+                                                if dist[d] <= 0 and not (widen and plan_is_placed(d)):
                                                         continue
                                                 sp, du, rm = build_plan(d)
                                                 plans[d] = {
@@ -1616,11 +2124,40 @@ if __name__ == "__main__":
                                                 'rams': rams,
                                                 'L': L
                                         }
+                                        if selection_policy_cmp is not None:
+                                                # The deterministic policy selects one deployment per
+                                                # leaf, so its support is a single point and every rule
+                                                # degenerates to open_loop. Only a widened candidate
+                                                # set gives a rule anything to decide here.
+                                                dist = [0.0] * num_deployment
+                                                dist[int(sel_work)] = 1.0
+                                                plans = {int(sel_work): {
+                                                        'selected_places': selected_places,
+                                                        'durations': durations,
+                                                        'rams': rams,
+                                                        'base_T': plan_base_T(selected_places, durations, leaf),
+                                                }}
+                                                if widen:
+                                                        for d in range(num_deployment):
+                                                                if d in plans or not plan_is_placed(d):
+                                                                        continue
+                                                                sp, du, rm = build_plan(d)
+                                                                plans[d] = {
+                                                                        'selected_places': sp,
+                                                                        'durations': du,
+                                                                        'rams': rm,
+                                                                        'base_T': plan_base_T(sp, du, leaf),
+                                                                }
+                                                perwf[w][leaf]['dist'] = dist
+                                                perwf[w][leaf]['plans'] = plans
 
                         perwf[w]['a'] = a
                         perwf[w]['b'] = b
                         perwf[w]['num_paths'] = num_paths_w
                         perwf[w]['path_order'] = path_order
+                        # Executions an arriving request has to start on; the
+                        # blocking-aware rules probe exactly these.
+                        perwf[w]['entry_funcs'] = entry_functions(b, path_order, num_paths_w)
 
                 curr_utilization=np.zeros((num_nodes_global,1))
                 func_blocked=np.zeros((num_workflows,num_functions))
@@ -1644,6 +2181,7 @@ if __name__ == "__main__":
                 # sel_counts[w][leaf][d] = number of requests that sampled
                 # deployment d; drives the Monte-Carlo monetary cost below.
                 sel_counts = [[{} for _ in range(num_leaves)] for _ in range(num_workflows)]
+                sel_stats = new_selection_stats()
                 for cur_t in range(sim_time):
 
                         requests[cur_t]=rng.poisson(request_rates)
@@ -1855,11 +2393,19 @@ if __name__ == "__main__":
                                                         base_T = max(base_T_paths) if base_T_paths else 0
                                                         deployment_id = int(info.get('deployment', w))
                                                 for i in range(n):
-                                                        if stochastic_selection:
+                                                        if stochastic_selection or (
+                                                                        selection_policy_cmp is not None and 'dist' in info):
                                                                 # Sample this request's deployment from the policy
                                                                 # H[leaf,:] and use that deployment's plan/base_T.
                                                                 dist = info['dist']
-                                                                d_sel = int(rng_sel.choice(len(dist), p=dist))
+                                                                if selection_policy_cmp is None:
+                                                                        d_sel = int(rng_sel.choice(len(dist), p=dist))
+                                                                else:
+                                                                        d_sel = choose_deployment(
+                                                                                selection_policy_cmp, dist, info['plans'],
+                                                                                perwf[w].get('entry_funcs', []), node_active,
+                                                                                node_ram_max, w, cur_t, rng_sel,
+                                                                                sel_counts[w][leaf], sel_stats)
                                                                 plan = info['plans'].get(d_sel)
                                                                 if plan is None:
                                                                         continue
@@ -2084,24 +2630,29 @@ if __name__ == "__main__":
                                 time_cost_all += weight*time_cost
                                 money_cost_all += weight*money_cost
 
-        overall_cost = w_1 * money_cost_all+w_2 * sum(req_done_list)
-        print(overall_cost)
-        results['overall_cost_comparison'] = overall_cost[0]
+        # Only the comparison run produces these; without it money_cost_all and
+        # req_done_list still hold the OWN run's values and this block would
+        # report them as the comparison cost (and crash on the scalar index).
+        if comparison:
+                overall_cost = w_1 * money_cost_all+w_2 * sum(req_done_list)
+                print(overall_cost)
+                results['overall_cost_comparison'] = overall_cost[0]
 
-        # Persist the comparison run's cost split in a sibling file (results.json
-        # itself only carries overall_cost_comparison and is consumed by the
-        # visualization scripts, so its content stays unchanged). The comparison
-        # is the centralized solve or the all-on-cloud heuristic depending on
-        # the run's settings; the flag records which one produced these costs.
-        comparison_results = {
-                'heuristic': bool(heuristic),
-                'overall_cost': float(np.ravel(overall_cost)[0]),
-                'money_cost': float(np.ravel(money_cost_all)[0]),
-                'time_cost': float(np.ravel(time_cost_all)[0]),
-                'complete_time_cost': float(sum(sum(waiting_acc))),
-        }
-        with open(os.path.join(results_dir, "results_comparison.json"), "w") as f:
-                json.dump(comparison_results, f, indent=4)
+                # Persist the comparison run's cost split in a sibling file (results.json
+                # itself only carries overall_cost_comparison and is consumed by the
+                # visualization scripts, so its content stays unchanged). The comparison
+                # is the centralized solve or the all-on-cloud heuristic depending on
+                # the run's settings; the flag records which one produced these costs.
+                comparison_results = {
+                        'heuristic': bool(heuristic),
+                        'comparison_mode': comparison_mode,
+                        'overall_cost': float(np.ravel(overall_cost)[0]),
+                        'money_cost': float(np.ravel(money_cost_all)[0]),
+                        'time_cost': float(np.ravel(time_cost_all)[0]),
+                        'complete_time_cost': float(sum(sum(waiting_acc))),
+                }
+                with open(os.path.join(results_dir, "results_comparison.json"), "w") as f:
+                        json.dump(comparison_results, f, indent=4)
 
 
         # Store the aggregated costs (results.json: used by the visualization
