@@ -91,6 +91,17 @@ def simulate(num_run, seed, python_exe):
         "complete_time_cost": res["complete_time_cost"],
         "overall_cost_comparison": res.get("overall_cost_comparison"),
     }
+    # The comparison run's cost SPLIT, so a model-free placement can be stacked
+    # into its contributions like any other bar rather than only appearing as a
+    # total. Gated on the run's own comparison flag, because a stale
+    # results_comparison.json from an earlier run would otherwise be picked up.
+    if cfg.get("comparison"):
+        cmp_path = os.path.join("results", f"run_{num_run}", "results_comparison.json")
+        if os.path.exists(cmp_path):
+            with open(cmp_path, "r") as f:
+                cmp_res = json.load(f)
+            for key in ("money_cost", "time_cost", "complete_time_cost"):
+                row[f"{key}_comparison"] = cmp_res.get(key)
     lat = latency_of(num_run)
     if lat is not None:
         row["latency"] = lat

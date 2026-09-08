@@ -511,6 +511,159 @@ def choose_deployment(pol, dist, plans, entries, node_active, node_ram_max,
         return int(d_sel)
 
 
+# ---- Arrival process ------------------------------------------------------
+#
+# The default stream is stationary Poisson: every second draws
+# rng.poisson(request_rates) from a rate matrix that never changes. The Azure
+# Functions Trace 2019 replaces that with a per-minute intensity measured on a
+# production platform.
+#
+# Two properties of that dataset decide the design. It holds an invocation
+# COUNT per function per minute - 1440 columns, one per minute of the day - and
+# no arrival timestamps at all, so nothing below 60 s comes from the data. And
+# it runs at rates far above this architecture's: a (workflow, leaf) stream
+# here sees about 0.26 invocations per minute, where a trace function would
+# emit 0,0,1,0,0,1,... - shot noise indistinguishable from the Poisson already
+# in place. The trace therefore supplies the temporal SHAPE while lambda keeps
+# the LEVEL: per-minute counts are normalized to unit mean and multiply
+# request_rates. Placements stay optimal for the rates they were solved for, so
+# nothing is re-solved and the result stays comparable with the Poisson runs.
+#
+# With no trace configured the multiplier is exactly 1.0, and IEEE 754
+# guarantees x * 1.0 == x, so rng.poisson receives a bit-identical array and
+# every earlier run reproduces exactly.
+ARRIVAL_TRACE_DEFAULTS = {
+        "path": None,
+        "window_minutes": 30,
+        # "window" rescales the selected window to unit mean, so every stream
+        # realizes the design load and burstiness is the only changed factor
+        # against the Poisson control. "day" normalizes over the whole day
+        # instead, which leaves each window at its own load level - a
+        # deliberate deployment-estimate-vs-reality experiment, not the default.
+        "normalize": "window",
+        # Correlation across streams, which is what decides whether the trace
+        # changes anything. A single (workflow, leaf) stream runs at ~0.26
+        # invocations/minute, where the trace's intensity modulation (shape CV
+        # 0.22 over 30 minutes, 0.67 over a full day) is far below the Poisson
+        # sampling noise of the stream itself (~1.96). Blocking, however, is
+        # driven by the AGGREGATE load on a node, where Poisson noise averages
+        # down as 1/sqrt(n) while a shared temporal pattern does not. Measured
+        # per-minute CV of the architecture-wide arrival count: Poisson 0.137,
+        # "leaf" 0.224, "shared" 0.258.
+        #   "leaf"          one application per leaf, all its workflows together
+        #   "shared"        one application for the whole architecture: the
+        #                   single-region diurnal case, and the strongest arm
+        #   "workflow_leaf" one per stream; decorrelates the most
+        "scope": "leaf",
+        "mode": "nhpp",
+        "load_factor": 1.0,
+}
+TRACE_NORMALIZATIONS = ("window", "day")
+TRACE_SCOPES = ("leaf", "shared", "workflow_leaf")
+TRACE_MODES = ("nhpp",)
+
+
+def normalize_arrival_trace(cfg):
+        """Validate the parameter-file block; None keeps the Poisson stream.
+
+        Absent or null means the arrival process of every previous run, and the
+        caller then multiplies by an all-ones array, so those results stay
+        bit-for-bit reproducible.
+        """
+        if not cfg:
+                return None
+        tr = dict(ARRIVAL_TRACE_DEFAULTS)
+        for key, value in cfg.items():
+                if key not in ARRIVAL_TRACE_DEFAULTS:
+                        raise ValueError("unknown arrival_trace key " + str(key))
+                if value is not None:
+                        tr[key] = value
+        if not tr["path"]:
+                raise ValueError("arrival_trace.path is required; build it with "
+                                 "build_arrival_trace.py")
+        if tr["normalize"] not in TRACE_NORMALIZATIONS:
+                raise ValueError("arrival_trace.normalize must be one of "
+                                 + str(TRACE_NORMALIZATIONS))
+        if tr["scope"] not in TRACE_SCOPES:
+                raise ValueError("arrival_trace.scope must be one of "
+                                 + str(TRACE_SCOPES))
+        if tr["mode"] not in TRACE_MODES:
+                # Exact per-minute replay only means something once the offered
+                # load is scaled to the trace's own level; at this architecture's
+                # rates it is indistinguishable from the NHPP draw.
+                raise ValueError("arrival_trace.mode must be one of "
+                                 + str(TRACE_MODES))
+        tr["window_minutes"] = int(tr["window_minutes"])
+        tr["load_factor"] = float(tr["load_factor"])
+        return tr
+
+
+def build_shape_series(trace, sim_time, num_workflows, num_leaves, simulation_seed):
+        """Per-second multiplier of lambda; all ones when no trace is configured.
+
+        Returned shape is (sim_time, num_leaves) for scope "leaf" and
+        (sim_time, num_workflows, num_leaves) for "workflow_leaf"; both
+        broadcast against request_rates, which is (num_workflows, num_leaves).
+        """
+        if trace is None:
+                return np.ones((sim_time, num_leaves))
+        data = load_json_cached(trace["path"])
+        apps = data["apps"]
+        if not apps:
+                raise ValueError("arrival_trace file holds no applications")
+        minutes_per_day = int(data.get("minutes_per_day", 1440))
+        window = int(trace["window_minutes"])
+        if window * 60 < sim_time:
+                raise ValueError("arrival_trace.window_minutes=%d covers %d s but "
+                                 "simulation_time is %d" % (window, window * 60, sim_time))
+        # The window is picked from the seed ALONE. Both policies of a paired
+        # comparison run the same simulation_seed and therefore see the same
+        # half hour of the trace; deriving the offset from anything else would
+        # destroy the pairing the whole study rests on.
+        offsets = data["offsets"]
+        offset = int(offsets[simulation_seed % len(offsets)])
+        n_app = len(apps)
+        cache = {}
+
+        def shape_of(app_idx):
+                if app_idx in cache:
+                        return cache[app_idx]
+                counts = np.asarray(apps[app_idx]["counts"], dtype=float)
+                win = counts[[(offset + j) % minutes_per_day for j in range(window)]]
+                mean = win.mean() if trace["normalize"] == "window" else counts.mean()
+                if mean <= 0:
+                        # Sampling quality and rate are inseparable: an
+                        # application at this architecture's own ~0.37
+                        # invocations/minute sees about 11 invocations in half
+                        # an hour and many windows none at all, so its series
+                        # admits no shape. That is exactly why the shape has to
+                        # come from a well-sampled application - summing several
+                        # quiet ones just reproduces a busy one.
+                        raise ValueError(
+                                "arrival_trace app %d has zero invocations over the "
+                                "selected window: the application is too sparsely "
+                                "sampled to define a shape at window_minutes=%d"
+                                % (app_idx, window))
+                cache[app_idx] = win / mean
+                return cache[app_idx]
+
+        if trace["scope"] == "shared":
+                # One pattern for the whole architecture. The application is
+                # picked from the seed, so the paired policies still agree.
+                one = shape_of(simulation_seed % n_app)
+                per_minute = np.repeat(one[:, None], num_leaves, axis=1)
+        elif trace["scope"] == "leaf":
+                per_minute = np.stack([shape_of(k % n_app) for k in range(num_leaves)],
+                                      axis=1)
+        else:
+                per_minute = np.zeros((window, num_workflows, num_leaves))
+                for w in range(num_workflows):
+                        for k in range(num_leaves):
+                                per_minute[:, w, k] = shape_of((w * num_leaves + k) % n_app)
+        per_second = np.repeat(per_minute, 60, axis=0)[:sim_time]
+        return per_second * trace["load_factor"]
+
+
 if __name__ == "__main__":
 
 
@@ -557,6 +710,11 @@ if __name__ == "__main__":
         if selection_policy is not None and parameter_general_config.get("lazy_start", False):
                 raise ValueError("selection_policy is implemented for the default "
                                  "scheduler only; set lazy_start to false")
+        # Arrival process: absent or null keeps the stationary Poisson stream of
+        # every earlier run. Read once - both the own and the comparison half
+        # below share these locals.
+        arrival_trace = normalize_arrival_trace(
+                parameter_general_config.get("arrival_trace", None))
         general_config_path=f"cloud/run_{num_run}/general_config.json"
         cloud_general_config = load_json_cached(general_config_path)
         num_leaves=cloud_general_config["num_leaves"]
@@ -679,6 +837,9 @@ if __name__ == "__main__":
                 for k in range(num_leaves):
                         request_rates[t, k] = cloud_config["providers"][f"provider_{k + num_other}"]["request_rate"]
         requests = np.zeros((sim_time, num_workflows, num_leaves))
+        # Per-second multiplier of lambda; exactly 1.0 everywhere without a trace.
+        shape_sec = build_shape_series(arrival_trace, sim_time, num_workflows,
+                                       num_leaves, simulation_seed)
 
         # RAM capacity per physical node: only edge (tinyfaas) nodes are
         # limited; cloud nodes never block due to RAM.
@@ -1157,7 +1318,7 @@ if __name__ == "__main__":
         # (jumping curr_time to the earliest finishing execution if blocked).
         for cur_t in range(sim_time):
 
-                requests[cur_t] = rng.poisson(request_rates)
+                requests[cur_t] = rng.poisson(request_rates * shape_sec[cur_t])
                 lazy_start = parameter_general_config.get('lazy_start', False)
                 if lazy_start:
 
@@ -1819,6 +1980,11 @@ if __name__ == "__main__":
                         for k in range(num_leaves):
                                 request_rates[t,k]=cloud_config["providers"][f"provider_{k+num_other}"]["request_rate"]
                 requests=np.zeros((sim_time,num_workflows,num_leaves))
+                # Same arrival stream as the own run: the comparison is the
+                # reference it is scored against, so it must not silently stay
+                # Poisson while the own half runs the trace.
+                shape_sec = build_shape_series(arrival_trace, sim_time, num_workflows,
+                                               num_leaves, simulation_seed)
                 cloud_full_path = in_path("cloud", "requirements_cloud_full.json")
                 cloud_full = load_json_cached(cloud_full_path)
                 num_nodes_global = cloud_full.get('num_nodes', 0)
@@ -2184,7 +2350,7 @@ if __name__ == "__main__":
                 sel_stats = new_selection_stats()
                 for cur_t in range(sim_time):
 
-                        requests[cur_t]=rng.poisson(request_rates)
+                        requests[cur_t]=rng.poisson(request_rates * shape_sec[cur_t])
 
                         lazy_start = parameter_general_config.get('lazy_start', False)
                         if lazy_start:

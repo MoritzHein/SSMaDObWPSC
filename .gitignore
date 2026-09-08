@@ -11,3 +11,9 @@ Joshuas repo (old)
 Scheduling_Workflows_MILP
 UCC_MINLP
 *.log
+# Azure Functions trace CSVs (143 MB tarball); rebuild with build_arrival_trace.py
+data/
+*.tar.xz
+invocations_per_function_md.anon.*.csv
+function_durations_percentiles.anon.*.csv
+app_memory_percentiles.anon.*.csv

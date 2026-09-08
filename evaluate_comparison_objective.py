@@ -88,6 +88,19 @@ if __name__ == "__main__":
         if args.count_weights:
                 # The simulation's exact request sample: same seed, same draw
                 # order (one poisson over the full rate matrix per second).
+                # That replica is only valid for the stationary Poisson stream.
+                # With an arrival trace the simulator multiplies the rate matrix
+                # by a per-second, per-leaf intensity taken from the trace, so
+                # this loop would silently report weights for a workload the run
+                # never saw. Fail instead of reporting a wrong number.
+                if parameter_general_config.get("arrival_trace"):
+                        raise SystemExit(
+                                "--count_weights cannot reproduce run %d: it sets "
+                                "arrival_trace, so the request counts come from a "
+                                "trace-modulated intensity rather than a stationary "
+                                "Poisson draw. Use the default lambda*sim_time "
+                                "weighting, which the trace leaves unchanged in "
+                                "expectation." % num_run)
                 rng = np.random.default_rng(42)
                 overall_requests = np.zeros((num_workflows, num_leaves))
                 for cur_t in range(sim_time):
